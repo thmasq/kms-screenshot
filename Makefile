@@ -1,7 +1,7 @@
 CC = gcc
 # Use -g for debugging symbols, -O2 for optimization
-CFLAGS = -Wall -Wextra -std=c99 -g `pkg-config --cflags libdrm libdrm_amdgpu`
-LIBS = `pkg-config --libs libdrm libdrm_amdgpu`
+CFLAGS = -Wall -Wextra -std=c99 -g `pkg-config --cflags libdrm libdrm_amdgpu vulkan`
+LIBS = `pkg-config --libs libdrm libdrm_amdgpu vulkan`
 TARGET = kms-screenshot
 SOURCE = kms-screenshot.c
 

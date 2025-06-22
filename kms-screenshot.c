@@ -20,6 +20,18 @@
 #include <libdrm/amdgpu.h>
 #include <libdrm/amdgpu_drm.h>
 
+#include <vulkan/vulkan.h>
+#include <vulkan/vulkan_core.h>
+
+typedef struct {
+    VkInstance instance;
+    VkPhysicalDevice physical_device;
+    VkDevice device;
+    VkQueue queue;
+    uint32_t queue_family_index;
+    VkCommandPool command_pool;
+} VulkanContext;
+
 // Define formats that might not be in older headers
 #ifndef DRM_FORMAT_ABGR16161616
 #define DRM_FORMAT_ABGR16161616 fourcc_code('A', 'B', '4', '8')
@@ -43,6 +55,189 @@
 #define SDMA_PKT_HEADER_SUB_OP(x)	(((x) & 0xFF) << 8)
 #define SDMA_PKT_COPY_LINEAR_HEADER_DWORD	(SDMA_PKT_HEADER_OP(SDMA_OPCODE_COPY) | \
 						 SDMA_PKT_HEADER_SUB_OP(SDMA_COPY_SUB_OPCODE_LINEAR))
+
+static int init_vulkan_context(VulkanContext *ctx) {
+    VkResult result;
+    
+    // Create Vulkan instance with CORRECT instance extensions only
+    VkApplicationInfo app_info = {
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pApplicationName = "KMS Screenshot",
+        .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
+        .pEngineName = "No Engine",
+        .engineVersion = VK_MAKE_VERSION(1, 0, 0),
+        .apiVersion = VK_API_VERSION_1_2,
+    };
+    
+    // These are INSTANCE extensions (not device extensions!)
+    const char* required_instance_extensions[] = {
+        VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,  // "VK_KHR_external_memory_capabilities"
+        VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, // "VK_KHR_get_physical_device_properties2"
+    };
+    
+    VkInstanceCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .pApplicationInfo = &app_info,
+        .enabledExtensionCount = 2,
+        .ppEnabledExtensionNames = required_instance_extensions,
+    };
+    
+    result = vkCreateInstance(&create_info, NULL, &ctx->instance);
+    if (result != VK_SUCCESS) {
+        printf("Failed to create Vulkan instance: %d\n", result);
+        return -1;
+    }
+    
+    printf("Vulkan instance created with correct extensions\n");
+    
+    // Find physical device (prefer discrete GPU, fallback to any)
+    uint32_t device_count = 0;
+    vkEnumeratePhysicalDevices(ctx->instance, &device_count, NULL);
+    if (device_count == 0) {
+        printf("No Vulkan-capable devices found\n");
+        vkDestroyInstance(ctx->instance, NULL);
+        return -1;
+    }
+    
+    VkPhysicalDevice* devices = malloc(device_count * sizeof(VkPhysicalDevice));
+    vkEnumeratePhysicalDevices(ctx->instance, &device_count, devices);
+    
+    ctx->physical_device = VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < device_count; i++) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(devices[i], &props);
+        
+        // Check if device supports required DEVICE extensions
+        uint32_t ext_count;
+        vkEnumerateDeviceExtensionProperties(devices[i], NULL, &ext_count, NULL);
+        VkExtensionProperties* extensions = malloc(ext_count * sizeof(VkExtensionProperties));
+        vkEnumerateDeviceExtensionProperties(devices[i], NULL, &ext_count, extensions);
+        
+        bool has_dmabuf = false, has_modifier = false, has_external_mem = false;
+        for (uint32_t j = 0; j < ext_count; j++) {
+            if (strcmp(extensions[j].extensionName, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) == 0)
+                has_dmabuf = true;
+            if (strcmp(extensions[j].extensionName, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME) == 0)
+                has_modifier = true;
+            if (strcmp(extensions[j].extensionName, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME) == 0)
+                has_external_mem = true;
+        }
+        free(extensions);
+        
+        if (has_dmabuf && has_modifier && has_external_mem) {
+            ctx->physical_device = devices[i];
+            printf("\tSelected Vulkan device: %s\n", props.deviceName);
+            printf("\tAll required device extensions available\n");
+            break;
+        }
+    }
+    free(devices);
+    
+    if (ctx->physical_device == VK_NULL_HANDLE) {
+        printf("No suitable Vulkan device found with required extensions\n");
+        vkDestroyInstance(ctx->instance, NULL);
+        return -1;
+    }
+    
+    // Find queue family that supports graphics and compute
+    uint32_t queue_family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(ctx->physical_device, &queue_family_count, NULL);
+    VkQueueFamilyProperties* queue_families = malloc(queue_family_count * sizeof(VkQueueFamilyProperties));
+    vkGetPhysicalDeviceQueueFamilyProperties(ctx->physical_device, &queue_family_count, queue_families);
+    
+    ctx->queue_family_index = UINT32_MAX;
+    for (uint32_t i = 0; i < queue_family_count; i++) {
+        if (queue_families[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT)) {
+            ctx->queue_family_index = i;
+            break;
+        }
+    }
+    free(queue_families);
+    
+    if (ctx->queue_family_index == UINT32_MAX) {
+        printf("No suitable queue family found\n");
+        vkDestroyInstance(ctx->instance, NULL);
+        return -1;
+    }
+    
+    // Create logical device with DEVICE extensions
+    const char* device_extensions[] = {
+        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,    // Device extension
+        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,  // Device extension  
+        VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,            // Device extension
+    };
+    
+    float queue_priority = 1.0f;
+    VkDeviceQueueCreateInfo queue_create_info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = ctx->queue_family_index,
+        .queueCount = 1,
+        .pQueuePriorities = &queue_priority,
+    };
+    
+    VkDeviceCreateInfo device_create_info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .queueCreateInfoCount = 1,
+        .pQueueCreateInfos = &queue_create_info,
+        .enabledExtensionCount = 3,
+        .ppEnabledExtensionNames = device_extensions,
+    };
+    
+    result = vkCreateDevice(ctx->physical_device, &device_create_info, NULL, &ctx->device);
+    if (result != VK_SUCCESS) {
+        printf("Failed to create Vulkan device: %d\n", result);
+        vkDestroyInstance(ctx->instance, NULL);
+        return -1;
+    }
+    
+    printf("\tVulkan device created with required device extensions\n");
+    
+    // Get queue and create command pool
+    vkGetDeviceQueue(ctx->device, ctx->queue_family_index, 0, &ctx->queue);
+    
+    VkCommandPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = ctx->queue_family_index,
+    };
+    
+    result = vkCreateCommandPool(ctx->device, &pool_info, NULL, &ctx->command_pool);
+    if (result != VK_SUCCESS) {
+        printf("Failed to create command pool: %d\n", result);
+        vkDestroyDevice(ctx->device, NULL);
+        vkDestroyInstance(ctx->instance, NULL);
+        return -1;
+    }
+    
+    printf("\tVulkan context initialized successfully\n");
+    return 0;
+}
+
+static void cleanup_vulkan_context(VulkanContext *ctx) {
+    if (ctx->command_pool != VK_NULL_HANDLE)
+        vkDestroyCommandPool(ctx->device, ctx->command_pool, NULL);
+    if (ctx->device != VK_NULL_HANDLE)
+        vkDestroyDevice(ctx->device, NULL);
+    if (ctx->instance != VK_NULL_HANDLE)
+        vkDestroyInstance(ctx->instance, NULL);
+}
+
+static VkFormat drm_format_to_vulkan(uint32_t drm_format) {
+    switch (drm_format) {
+        case DRM_FORMAT_ABGR16161616:
+            return VK_FORMAT_R16G16B16A16_UNORM;
+        case DRM_FORMAT_ARGB8888:
+            return VK_FORMAT_B8G8R8A8_UNORM;
+        case DRM_FORMAT_XRGB8888:
+            return VK_FORMAT_B8G8R8A8_UNORM;
+        case DRM_FORMAT_ABGR8888:
+            return VK_FORMAT_R8G8B8A8_UNORM;
+        case DRM_FORMAT_XBGR8888:
+            return VK_FORMAT_R8G8B8A8_UNORM;
+        default:
+            return VK_FORMAT_UNDEFINED;
+    }
+}
 
 // Simple PPM image writer
 static int write_ppm(const char *filename, uint32_t width, uint32_t height, uint8_t *rgb_data) {
@@ -779,6 +974,385 @@ static int find_primary_framebuffer(int drm_fd) {
     return best_fb_id > 0 ? (int)best_fb_id : -1;
 }
 
+static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t fb_id, 
+                                              const char *output_path) {
+    VkResult result;
+    drmModeFB2 *fb2 = drmModeGetFB2(drm_fd, fb_id);
+    if (!fb2) {
+        printf("Failed to get framebuffer info\n");
+        return -1;
+    }
+    
+    printf("\tVulkan deswizzling FB %u: %ux%u, format=%s, modifier=0x%016" PRIx64 "\n",
+           fb_id, fb2->width, fb2->height, format_to_string(fb2->pixel_format), fb2->modifier);
+    
+    VkFormat vk_format = drm_format_to_vulkan(fb2->pixel_format);
+    if (vk_format == VK_FORMAT_UNDEFINED) {
+        printf("\tUnsupported format for Vulkan: %s\n", format_to_string(fb2->pixel_format));
+        drmModeFreeFB2(fb2);
+        return -1;
+    }
+    
+    // Export framebuffer as DMA-BUF
+    int dmabuf_fd;
+    if (drmPrimeHandleToFD(drm_fd, fb2->handles[0], O_CLOEXEC, &dmabuf_fd) != 0) {
+        printf("\tFailed to export framebuffer as DMA-BUF: %s\n", strerror(errno));
+        drmModeFreeFB2(fb2);
+        return -1;
+    }
+    
+    printf("\tExported framebuffer as DMA-BUF fd=%d\n", dmabuf_fd);
+    
+    // Import DMA-BUF as Vulkan image with modifier support
+    VkExternalMemoryImageCreateInfo external_memory_info = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    
+    VkImageDrmFormatModifierExplicitCreateInfoEXT modifier_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+        .pNext = &external_memory_info,
+        .drmFormatModifier = fb2->modifier,
+        .drmFormatModifierPlaneCount = 1,
+        .pPlaneLayouts = &(VkSubresourceLayout){
+            .offset = fb2->offsets[0],
+            .size = fb2->pitches[0] * fb2->height,
+            .rowPitch = fb2->pitches[0],
+            .arrayPitch = 0,
+            .depthPitch = 0,
+        },
+    };
+    
+    VkImageCreateInfo src_image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = &modifier_info,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = vk_format,
+        .extent = {fb2->width, fb2->height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    
+    VkImage src_image;
+    result = vkCreateImage(ctx->device, &src_image_info, NULL, &src_image);
+    if (result != VK_SUCCESS) {
+        printf("\tFailed to create source image: %d\n", result);
+        close(dmabuf_fd);
+        drmModeFreeFB2(fb2);
+        return -1;
+    }
+    
+    printf("\tCreated tiled source image\n");
+    
+    // Get memory requirements and import DMA-BUF
+    VkMemoryRequirements mem_reqs;
+    vkGetImageMemoryRequirements(ctx->device, src_image, &mem_reqs);
+    
+    VkImportMemoryFdInfoKHR import_info = {
+        .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        .fd = dmabuf_fd,
+    };
+    
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &import_info,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = 0, // Find suitable memory type
+    };
+    
+    // Find memory type
+    VkPhysicalDeviceMemoryProperties mem_props;
+    vkGetPhysicalDeviceMemoryProperties(ctx->physical_device, &mem_props);
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        if ((mem_reqs.memoryTypeBits & (1 << i))) {
+            alloc_info.memoryTypeIndex = i;
+            break;
+        }
+    }
+    
+    VkDeviceMemory src_memory;
+    result = vkAllocateMemory(ctx->device, &alloc_info, NULL, &src_memory);
+    if (result != VK_SUCCESS) {
+        printf("\tFailed to import DMA-BUF memory: %d\n", result);
+        vkDestroyImage(ctx->device, src_image, NULL);
+        close(dmabuf_fd);
+        drmModeFreeFB2(fb2);
+        return -1;
+    }
+    
+    result = vkBindImageMemory(ctx->device, src_image, src_memory, 0);
+    if (result != VK_SUCCESS) {
+        printf("\tFailed to bind image memory: %d\n", result);
+        vkFreeMemory(ctx->device, src_memory, NULL);
+        vkDestroyImage(ctx->device, src_image, NULL);
+        close(dmabuf_fd);
+        drmModeFreeFB2(fb2);
+        return -1;
+    }
+    
+    printf("\tImported DMA-BUF as Vulkan memory\n");
+    
+    // Create linear destination image
+    VkImageCreateInfo dst_image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = vk_format,
+        .extent = {fb2->width, fb2->height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_LINEAR,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    
+    VkImage dst_image;
+    result = vkCreateImage(ctx->device, &dst_image_info, NULL, &dst_image);
+    if (result != VK_SUCCESS) {
+        printf("\tFailed to create destination image: %d\n", result);
+        vkFreeMemory(ctx->device, src_memory, NULL);
+        vkDestroyImage(ctx->device, src_image, NULL);
+        close(dmabuf_fd);
+        drmModeFreeFB2(fb2);
+        return -1;
+    }
+    
+    // Allocate memory for destination image
+    VkMemoryRequirements dst_mem_reqs;
+    vkGetImageMemoryRequirements(ctx->device, dst_image, &dst_mem_reqs);
+    
+    uint32_t dst_memory_type = UINT32_MAX;
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        if ((dst_mem_reqs.memoryTypeBits & (1 << i)) &&
+            (mem_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+            dst_memory_type = i;
+            break;
+        }
+    }
+    
+    if (dst_memory_type == UINT32_MAX) {
+        printf("\tNo suitable memory type for destination image\n");
+        vkDestroyImage(ctx->device, dst_image, NULL);
+        vkFreeMemory(ctx->device, src_memory, NULL);
+        vkDestroyImage(ctx->device, src_image, NULL);
+        close(dmabuf_fd);
+        drmModeFreeFB2(fb2);
+        return -1;
+    }
+    
+    VkMemoryAllocateInfo dst_alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = dst_mem_reqs.size,
+        .memoryTypeIndex = dst_memory_type,
+    };
+    
+    VkDeviceMemory dst_memory;
+    result = vkAllocateMemory(ctx->device, &dst_alloc_info, NULL, &dst_memory);
+    if (result != VK_SUCCESS) {
+        printf("\tFailed to allocate destination memory: %d\n", result);
+        vkDestroyImage(ctx->device, dst_image, NULL);
+        vkFreeMemory(ctx->device, src_memory, NULL);
+        vkDestroyImage(ctx->device, src_image, NULL);
+        close(dmabuf_fd);
+        drmModeFreeFB2(fb2);
+        return -1;
+    }
+    
+    result = vkBindImageMemory(ctx->device, dst_image, dst_memory, 0);
+    if (result != VK_SUCCESS) {
+        printf("\tFailed to bind destination memory: %d\n", result);
+        vkFreeMemory(ctx->device, dst_memory, NULL);
+        vkDestroyImage(ctx->device, dst_image, NULL);
+        vkFreeMemory(ctx->device, src_memory, NULL);
+        vkDestroyImage(ctx->device, src_image, NULL);
+        close(dmabuf_fd);
+        drmModeFreeFB2(fb2);
+        return -1;
+    }
+    
+    printf("\tCreated linear destination image\n");
+    
+    // Record and execute copy command
+    VkCommandBufferAllocateInfo cmd_alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = ctx->command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    
+    VkCommandBuffer cmd_buffer;
+    result = vkAllocateCommandBuffers(ctx->device, &cmd_alloc_info, &cmd_buffer);
+    if (result != VK_SUCCESS) {
+        printf("\tFailed to allocate command buffer: %d\n", result);
+        goto cleanup;
+    }
+    
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    
+    vkBeginCommandBuffer(cmd_buffer, &begin_info);
+    
+    // Transition images to optimal layouts
+    VkImageMemoryBarrier barriers[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = src_image,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = dst_image,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        },
+    };
+    
+    vkCmdPipelineBarrier(cmd_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, barriers);
+    
+    // Copy image (this will automatically handle deswizzling!)
+    VkImageCopy copy_region = {
+        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .srcOffset = {0, 0, 0},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .dstOffset = {0, 0, 0},
+        .extent = {fb2->width, fb2->height, 1},
+    };
+    
+    vkCmdCopyImage(cmd_buffer, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+    
+    printf("\tGPU deswizzling in progress...\n");
+    
+    // Transition destination for CPU read
+    VkImageMemoryBarrier final_barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = dst_image,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    
+    vkCmdPipelineBarrier(cmd_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 0, NULL, 1, &final_barrier);
+    
+    vkEndCommandBuffer(cmd_buffer);
+    
+    // Submit and wait
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd_buffer,
+    };
+    
+    result = vkQueueSubmit(ctx->queue, 1, &submit_info, VK_NULL_HANDLE);
+    if (result == VK_SUCCESS) {
+        result = vkQueueWaitIdle(ctx->queue);
+    }
+    
+    if (result != VK_SUCCESS) {
+        printf("\tFailed to execute copy command: %d\n", result);
+        goto cleanup;
+    }
+    
+    printf("\tGPU deswizzling completed successfully!\n");
+    
+    // Map and read the linear result
+    void *mapped_data;
+    result = vkMapMemory(ctx->device, dst_memory, 0, VK_WHOLE_SIZE, 0, &mapped_data);
+    if (result == VK_SUCCESS) {
+        // Get layout info for proper stride
+        VkImageSubresource subresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+        VkSubresourceLayout layout;
+        vkGetImageSubresourceLayout(ctx->device, dst_image, &subresource, &layout);
+        
+        printf("\tLinear layout: offset=%lu, size=%lu, rowPitch=%lu\n", 
+               layout.offset, layout.size, layout.rowPitch);
+        
+        // Convert and save
+        uint8_t *rgb_data = malloc(fb2->width * fb2->height * 3);
+        if (rgb_data) {
+            convert_to_rgb24(mapped_data, rgb_data, fb2->width, fb2->height,
+                           fb2->pixel_format, layout.rowPitch);
+            
+            if (write_ppm(output_path, fb2->width, fb2->height, rgb_data) == 0) {
+                printf("\tDeswizzled screenshot saved to %s\n", output_path);
+            }
+            free(rgb_data);
+        }
+        
+        vkUnmapMemory(ctx->device, dst_memory);
+    }
+    
+cleanup:
+    vkFreeMemory(ctx->device, dst_memory, NULL);
+    vkDestroyImage(ctx->device, dst_image, NULL);
+    vkFreeMemory(ctx->device, src_memory, NULL);
+    vkDestroyImage(ctx->device, src_image, NULL);
+    close(dmabuf_fd);
+    drmModeFreeFB2(fb2);
+    
+    return (result == VK_SUCCESS) ? 0 : -1;
+}
+
+// Update the main integration function
+static int capture_framebuffer_with_vulkan_fallback(int drm_fd, uint32_t fb_id, const char *output_path) {
+    drmModeFB2 *fb2 = drmModeGetFB2(drm_fd, fb_id);
+    if (!fb2) {
+        printf("Failed to get framebuffer info\n");
+        return -1;
+    }
+    
+    // Check if framebuffer needs deswizzling
+    if (fb2->modifier != 0 && fb2->modifier != DRM_FORMAT_MOD_LINEAR) {
+        printf("\tTiled framebuffer detected, attempting Vulkan deswizzling...\n");
+        
+        VulkanContext vk_ctx = {0};
+        if (init_vulkan_context(&vk_ctx) == 0) {
+            int result = vulkan_deswizzle_framebuffer(&vk_ctx, drm_fd, fb_id, output_path);
+            cleanup_vulkan_context(&vk_ctx);
+            
+            if (result == 0) {
+                drmModeFreeFB2(fb2);
+                return 0; // Success!
+            } else {
+                printf("\tVulkan deswizzling failed, falling back to AMDGPU method...\n");
+            }
+        } else {
+            printf("\tVulkan initialization failed, falling back to AMDGPU method...\n");
+        }
+    }
+    
+    drmModeFreeFB2(fb2);
+    
+    // Fallback to your original AMDGPU method
+    return capture_framebuffer_amdgpu(drm_fd, fb_id, output_path);
+}
+
 int main(int argc, char *argv[]) {
     if (getuid() != 0) {
         printf("This program requires root privileges to access DRM devices.\n");
@@ -835,7 +1409,7 @@ int main(int argc, char *argv[]) {
     }
     
     // Find framebuffer to capture
-    if (fb_id == 0) {
+if (fb_id == 0) {
         int found_fb = find_primary_framebuffer(drm_fd);
         if (found_fb < 0) {
             printf("No active framebuffers found. Try --list to see available framebuffers.\n");
@@ -846,9 +1420,19 @@ int main(int argc, char *argv[]) {
         printf("Auto-detected primary framebuffer: %u\n", fb_id);
     }
     
-    // Capture the framebuffer
-    int result = capture_framebuffer(drm_fd, fb_id, output_path);
+    // Check if this is an AMDGPU device and try Vulkan first
+    drmVersionPtr version = drmGetVersion(drm_fd);
+    int result = -1;
     
+    if (version && strcmp(version->name, "amdgpu") == 0) {
+        printf("\tAMDGPU detected, trying Vulkan deswizzling first...\n");
+        result = capture_framebuffer_with_vulkan_fallback(drm_fd, fb_id, output_path);
+    } else {
+        printf("\tNon-AMDGPU device, using standard capture method...\n");
+        result = capture_framebuffer(drm_fd, fb_id, output_path);
+    }
+    
+    if (version) drmFreeVersion(version);
     close(drm_fd);
     return result == 0 ? 0 : 1;
 }
