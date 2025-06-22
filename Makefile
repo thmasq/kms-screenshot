@@ -4,6 +4,8 @@ CFLAGS = -Wall -Wextra -std=c99 -g `pkg-config --cflags libdrm libdrm_amdgpu vul
 LIBS = `pkg-config --libs libdrm libdrm_amdgpu vulkan`
 TARGET = kms-screenshot
 SOURCE = kms-screenshot.c
+SHADER_SRC = hdr_tonemap.comp
+SPV_OUT = hdr_tonemap.comp.spv
 
 all: $(TARGET)
 
@@ -15,6 +17,11 @@ clean:
 
 install: $(TARGET)
 	install -m755 $(TARGET) /usr/local/bin/
+
+$(SPV_OUT): $(SHADER_SRC)
+	glslangValidator -V -o $@ $<
+
+shaderc: $(SPV_OUT)
 
 .PHONY: all clean install
 

@@ -1,0 +1,81 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba16) readonly uniform image2D inputImage;
+layout(binding = 1, rgba8) writeonly uniform image2D outputImage;
+
+// Tone mapping parameters
+layout(push_constant) uniform PushConstants {
+    float exposure;
+    float gamma;
+    uint tonemapMode; // 0=Reinhard, 1=ACES, 2=Hable
+} params;
+
+// Convert from linear to sRGB
+vec3 linearToSRGB(vec3 linear) {
+    vec3 higher = 1.055 * pow(linear, vec3(1.0/2.4)) - 0.055;
+    vec3 lower = linear * 12.92;
+    return mix(lower, higher, step(vec3(0.0031308), linear));
+}
+
+// Reinhard tone mapping
+vec3 reinhardTonemap(vec3 color) {
+    return color / (color + vec3(1.0));
+}
+
+// ACES filmic tone mapping
+vec3 acesFimicTonemap(vec3 x) {
+    float a = 2.51;
+    float b = 0.03;
+    float c = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);
+}
+
+// Uncharted 2 tone mapping
+vec3 hableTonemap(vec3 x) {
+    float A = 0.15;
+    float B = 0.50;
+    float C = 0.10;
+    float D = 0.20;
+    float E = 0.02;
+    float F = 0.30;
+    return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F;
+}
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imageSize = imageSize(inputImage);
+    
+    if (pixelCoord.x >= imageSize.x || pixelCoord.y >= imageSize.y) {
+        return;
+    }
+    
+    // Read HDR pixel (16-bit per channel, normalized to [0,1])
+    vec4 hdrColor = imageLoad(inputImage, pixelCoord);
+    
+    // For ABGR format, swap R and B
+    vec3 color = hdrColor.bgr;
+    
+    // Apply exposure
+    color *= params.exposure;
+    
+    // Apply tone mapping
+    if (params.tonemapMode == 0) {
+        color = reinhardTonemap(color);
+    } else if (params.tonemapMode == 1) {
+        color = acesFimicTonemap(color);
+    } else {
+        float W = 11.2;
+        color = hableTonemap(color * 2.0) / hableTonemap(vec3(W));
+    }
+    
+    // Apply gamma correction and convert to sRGB
+    color = pow(color, vec3(1.0 / params.gamma));
+    color = linearToSRGB(color);
+    
+    // Write SDR output (8-bit per channel)
+    imageStore(outputImage, pixelCoord, vec4(color, hdrColor.a));
+}
