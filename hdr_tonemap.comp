@@ -7,7 +7,7 @@ layout(binding = 1, rgba8) writeonly uniform image2D outputImage;
 
 layout(push_constant) uniform PushConstants {
     float exposure;
-    uint tonemapMode; // 0=Reinhard, 1=ACES_Simple, 2=ACES_Full, 3=Hable
+    uint tonemapMode; // 0=Reinhard, 1=ACES_fastest, 2=ACES_fast, 3=ACES_medium, 4=ACES_full 5=Hable, 6=Reinhard_extended, 7=Uchimura
 } params;
 
 // =======================================================================================
