@@ -22,6 +22,23 @@
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_core.h>
+#include "hdr_tonemap_comp_spv.h"
+
+extern unsigned char hdr_tonemap_comp_spv[];
+extern unsigned int hdr_tonemap_comp_spv_len;
+
+typedef struct {
+    float exposure;
+    float gamma;
+    uint32_t tonemapMode; // 0=Reinhard, 1=ACES, 2=Hable
+} ToneMappingPushConstants;
+
+typedef struct {
+    VkDescriptorSetLayout descriptor_set_layout;
+    VkPipelineLayout pipeline_layout;
+    VkPipeline compute_pipeline;
+    VkDescriptorPool descriptor_pool;
+} ComputePipeline;
 
 typedef struct {
     VkInstance instance;
@@ -55,6 +72,346 @@ typedef struct {
 #define SDMA_PKT_HEADER_SUB_OP(x)	(((x) & 0xFF) << 8)
 #define SDMA_PKT_COPY_LINEAR_HEADER_DWORD	(SDMA_PKT_HEADER_OP(SDMA_OPCODE_COPY) | \
 						 SDMA_PKT_HEADER_SUB_OP(SDMA_COPY_SUB_OPCODE_LINEAR))
+
+static int create_tonemap_compute_pipeline(VulkanContext *ctx, ComputePipeline *pipeline) {
+    VkResult result;
+    
+    // Create shader module
+    VkShaderModuleCreateInfo shader_info = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = hdr_tonemap_comp_spv_len,
+        .pCode = (uint32_t*)hdr_tonemap_comp_spv,
+    };
+    
+    VkShaderModule shader_module;
+    result = vkCreateShaderModule(ctx->device, &shader_info, NULL, &shader_module);
+    if (result != VK_SUCCESS) {
+        printf("Failed to create shader module: %d\n", result);
+        return -1;
+    }
+    
+    // Create descriptor set layout
+    VkDescriptorSetLayoutBinding bindings[2] = {
+        {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        },
+        {
+            .binding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        },
+    };
+    
+    VkDescriptorSetLayoutCreateInfo layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 2,
+        .pBindings = bindings,
+    };
+    
+    result = vkCreateDescriptorSetLayout(ctx->device, &layout_info, NULL, &pipeline->descriptor_set_layout);
+    if (result != VK_SUCCESS) {
+        printf("Failed to create descriptor set layout: %d\n", result);
+        vkDestroyShaderModule(ctx->device, shader_module, NULL);
+        return -1;
+    }
+    
+    // Create pipeline layout with push constants
+    VkPushConstantRange push_constant_range = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = sizeof(ToneMappingPushConstants),
+    };
+    
+    VkPipelineLayoutCreateInfo pipeline_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &pipeline->descriptor_set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_constant_range,
+    };
+    
+    result = vkCreatePipelineLayout(ctx->device, &pipeline_layout_info, NULL, &pipeline->pipeline_layout);
+    if (result != VK_SUCCESS) {
+        printf("Failed to create pipeline layout: %d\n", result);
+        vkDestroyDescriptorSetLayout(ctx->device, pipeline->descriptor_set_layout, NULL);
+        vkDestroyShaderModule(ctx->device, shader_module, NULL);
+        return -1;
+    }
+    
+    // Create compute pipeline
+    VkComputePipelineCreateInfo compute_pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = shader_module,
+            .pName = "main",
+        },
+        .layout = pipeline->pipeline_layout,
+    };
+    
+    result = vkCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &compute_pipeline_info, NULL, &pipeline->compute_pipeline);
+    if (result != VK_SUCCESS) {
+        printf("Failed to create compute pipeline: %d\n", result);
+        vkDestroyPipelineLayout(ctx->device, pipeline->pipeline_layout, NULL);
+        vkDestroyDescriptorSetLayout(ctx->device, pipeline->descriptor_set_layout, NULL);
+        vkDestroyShaderModule(ctx->device, shader_module, NULL);
+        return -1;
+    }
+    
+    // Create descriptor pool
+    VkDescriptorPoolSize pool_size = {
+        .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .descriptorCount = 2,
+    };
+    
+    VkDescriptorPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes = &pool_size,
+    };
+    
+    result = vkCreateDescriptorPool(ctx->device, &pool_info, NULL, &pipeline->descriptor_pool);
+    if (result != VK_SUCCESS) {
+        printf("Failed to create descriptor pool: %d\n", result);
+        vkDestroyPipeline(ctx->device, pipeline->compute_pipeline, NULL);
+        vkDestroyPipelineLayout(ctx->device, pipeline->pipeline_layout, NULL);
+        vkDestroyDescriptorSetLayout(ctx->device, pipeline->descriptor_set_layout, NULL);
+        vkDestroyShaderModule(ctx->device, shader_module, NULL);
+        return -1;
+    }
+    
+    vkDestroyShaderModule(ctx->device, shader_module, NULL);
+    printf("\tTone mapping compute pipeline created successfully\n");
+    return 0;
+}
+
+static void cleanup_compute_pipeline(VulkanContext *ctx, ComputePipeline *pipeline) {
+    if (pipeline->descriptor_pool != VK_NULL_HANDLE)
+        vkDestroyDescriptorPool(ctx->device, pipeline->descriptor_pool, NULL);
+    if (pipeline->compute_pipeline != VK_NULL_HANDLE)
+        vkDestroyPipeline(ctx->device, pipeline->compute_pipeline, NULL);
+    if (pipeline->pipeline_layout != VK_NULL_HANDLE)
+        vkDestroyPipelineLayout(ctx->device, pipeline->pipeline_layout, NULL);
+    if (pipeline->descriptor_set_layout != VK_NULL_HANDLE)
+        vkDestroyDescriptorSetLayout(ctx->device, pipeline->descriptor_set_layout, NULL);
+}
+
+static int apply_tone_mapping(VulkanContext *ctx, ComputePipeline *pipeline,
+                             VkImage input_image, VkImage output_image,
+                             uint32_t width, uint32_t height,
+                             float exposure, float gamma, uint32_t tonemap_mode) {
+    VkResult result;
+    
+    // Allocate descriptor set
+    VkDescriptorSetAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = pipeline->descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &pipeline->descriptor_set_layout,
+    };
+    
+    VkDescriptorSet descriptor_set;
+    result = vkAllocateDescriptorSets(ctx->device, &alloc_info, &descriptor_set);
+    if (result != VK_SUCCESS) {
+        printf("Failed to allocate descriptor set: %d\n", result);
+        return -1;
+    }
+    
+    // Create image views
+    VkImageViewCreateInfo input_view_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = input_image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_R16G16B16A16_UNORM,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+    
+    VkImageView input_view;
+    result = vkCreateImageView(ctx->device, &input_view_info, NULL, &input_view);
+    if (result != VK_SUCCESS) {
+        printf("Failed to create input image view: %d\n", result);
+        return -1;
+    }
+    
+    VkImageViewCreateInfo output_view_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = output_image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+    
+    VkImageView output_view;
+    result = vkCreateImageView(ctx->device, &output_view_info, NULL, &output_view);
+    if (result != VK_SUCCESS) {
+        printf("Failed to create output image view: %d\n", result);
+        vkDestroyImageView(ctx->device, input_view, NULL);
+        return -1;
+    }
+    
+    // Update descriptor set
+    VkDescriptorImageInfo image_infos[2] = {
+        {
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .imageView = input_view,
+        },
+        {
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .imageView = output_view,
+        },
+    };
+    
+    VkWriteDescriptorSet writes[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = descriptor_set,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &image_infos[0],
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = descriptor_set,
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &image_infos[1],
+        },
+    };
+    
+    vkUpdateDescriptorSets(ctx->device, 2, writes, 0, NULL);
+    
+    // Record and execute compute commands
+    VkCommandBufferAllocateInfo cmd_alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = ctx->command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    
+    VkCommandBuffer cmd_buffer;
+    result = vkAllocateCommandBuffers(ctx->device, &cmd_alloc_info, &cmd_buffer);
+    if (result != VK_SUCCESS) {
+        printf("Failed to allocate command buffer: %d\n", result);
+        vkDestroyImageView(ctx->device, output_view, NULL);
+        vkDestroyImageView(ctx->device, input_view, NULL);
+        return -1;
+    }
+    
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    
+    vkBeginCommandBuffer(cmd_buffer, &begin_info);
+    
+    // Transition images to general layout for compute
+    VkImageMemoryBarrier barriers[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = input_image,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = output_image,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        },
+    };
+    
+    vkCmdPipelineBarrier(cmd_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, barriers);
+    
+    // Bind compute pipeline and descriptor set
+    vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->compute_pipeline);
+    vkCmdBindDescriptorSets(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline_layout,
+                           0, 1, &descriptor_set, 0, NULL);
+    
+    // Set push constants
+    ToneMappingPushConstants push_constants = {
+        .exposure = exposure,
+        .gamma = gamma,
+        .tonemapMode = tonemap_mode,
+    };
+    
+    vkCmdPushConstants(cmd_buffer, pipeline->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                      0, sizeof(push_constants), &push_constants);
+    
+    // Dispatch compute shader (16x16 workgroup size)
+    uint32_t group_count_x = (width + 15) / 16;
+    uint32_t group_count_y = (height + 15) / 16;
+    vkCmdDispatch(cmd_buffer, group_count_x, group_count_y, 1);
+    
+    // Memory barrier before host read
+    VkImageMemoryBarrier final_barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = output_image,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    
+    vkCmdPipelineBarrier(cmd_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 0, NULL, 1, &final_barrier);
+    
+    vkEndCommandBuffer(cmd_buffer);
+    
+    // Submit and wait
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd_buffer,
+    };
+    
+    result = vkQueueSubmit(ctx->queue, 1, &submit_info, VK_NULL_HANDLE);
+    if (result == VK_SUCCESS) {
+        result = vkQueueWaitIdle(ctx->queue);
+    }
+    
+    printf("\tTone mapping applied: exposure=%.2f, gamma=%.2f, mode=%u\n", 
+           exposure, gamma, tonemap_mode);
+    
+    // Cleanup
+    vkDestroyImageView(ctx->device, output_view, NULL);
+    vkDestroyImageView(ctx->device, input_view, NULL);
+    
+    return (result == VK_SUCCESS) ? 0 : -1;
+}
 
 static int init_vulkan_context(VulkanContext *ctx) {
     VkResult result;
@@ -975,7 +1332,7 @@ static int find_primary_framebuffer(int drm_fd) {
 }
 
 static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t fb_id, 
-                                              const char *output_path) {
+                                                    const char *output_path) {
     VkResult result;
     drmModeFB2 *fb2 = drmModeGetFB2(drm_fd, fb_id);
     if (!fb2) {
@@ -993,6 +1350,9 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
         return -1;
     }
     
+    // Check if this is HDR content that needs tone mapping
+    int needs_tone_mapping = (fb2->pixel_format == DRM_FORMAT_ABGR16161616);
+    
     // Export framebuffer as DMA-BUF
     int dmabuf_fd;
     if (drmPrimeHandleToFD(drm_fd, fb2->handles[0], O_CLOEXEC, &dmabuf_fd) != 0) {
@@ -1002,6 +1362,17 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
     }
     
     printf("\tExported framebuffer as DMA-BUF fd=%d\n", dmabuf_fd);
+    
+    // Setup compute pipeline if needed
+    ComputePipeline compute_pipeline = {0};
+    if (needs_tone_mapping) {
+        if (create_tonemap_compute_pipeline(ctx, &compute_pipeline) != 0) {
+            printf("\tFailed to create tone mapping pipeline\n");
+            close(dmabuf_fd);
+            drmModeFreeFB2(fb2);
+            return -1;
+        }
+    }
     
     // Import DMA-BUF as Vulkan image with modifier support
     VkExternalMemoryImageCreateInfo external_memory_info = {
@@ -1033,7 +1404,7 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | (needs_tone_mapping ? VK_IMAGE_USAGE_STORAGE_BIT : 0),
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
@@ -1042,6 +1413,7 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
     result = vkCreateImage(ctx->device, &src_image_info, NULL, &src_image);
     if (result != VK_SUCCESS) {
         printf("\tFailed to create source image: %d\n", result);
+        if (needs_tone_mapping) cleanup_compute_pipeline(ctx, &compute_pipeline);
         close(dmabuf_fd);
         drmModeFreeFB2(fb2);
         return -1;
@@ -1081,6 +1453,7 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
     if (result != VK_SUCCESS) {
         printf("\tFailed to import DMA-BUF memory: %d\n", result);
         vkDestroyImage(ctx->device, src_image, NULL);
+        if (needs_tone_mapping) cleanup_compute_pipeline(ctx, &compute_pipeline);
         close(dmabuf_fd);
         drmModeFreeFB2(fb2);
         return -1;
@@ -1091,6 +1464,7 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
         printf("\tFailed to bind image memory: %d\n", result);
         vkFreeMemory(ctx->device, src_memory, NULL);
         vkDestroyImage(ctx->device, src_image, NULL);
+        if (needs_tone_mapping) cleanup_compute_pipeline(ctx, &compute_pipeline);
         close(dmabuf_fd);
         drmModeFreeFB2(fb2);
         return -1;
@@ -1098,30 +1472,90 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
     
     printf("\tImported DMA-BUF as Vulkan memory\n");
     
-    // Create linear destination image
+    // Create intermediate and destination images
+    VkImage intermediate_image = VK_NULL_HANDLE;
+    VkDeviceMemory intermediate_memory = VK_NULL_HANDLE;
+    VkImage dst_image;
+    VkDeviceMemory dst_memory;
+    VkFormat final_format = needs_tone_mapping ? VK_FORMAT_R8G8B8A8_UNORM : vk_format;
+    
+    if (needs_tone_mapping) {
+        // Create intermediate linear HDR image
+        VkImageCreateInfo intermediate_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = vk_format,
+            .extent = {fb2->width, fb2->height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_LINEAR,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        
+        result = vkCreateImage(ctx->device, &intermediate_info, NULL, &intermediate_image);
+        if (result != VK_SUCCESS) {
+            printf("\tFailed to create intermediate image: %d\n", result);
+            goto cleanup;
+        }
+        
+        // Allocate memory for intermediate image
+        VkMemoryRequirements inter_mem_reqs;
+        vkGetImageMemoryRequirements(ctx->device, intermediate_image, &inter_mem_reqs);
+        
+        uint32_t inter_memory_type = UINT32_MAX;
+        for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+            if ((inter_mem_reqs.memoryTypeBits & (1 << i))) {
+                inter_memory_type = i;
+                break;
+            }
+        }
+        
+        if (inter_memory_type == UINT32_MAX) {
+            printf("\tNo suitable memory type for intermediate image\n");
+            goto cleanup;
+        }
+        
+        VkMemoryAllocateInfo inter_alloc_info = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = inter_mem_reqs.size,
+            .memoryTypeIndex = inter_memory_type,
+        };
+        
+        result = vkAllocateMemory(ctx->device, &inter_alloc_info, NULL, &intermediate_memory);
+        if (result != VK_SUCCESS) {
+            printf("\tFailed to allocate intermediate memory: %d\n", result);
+            goto cleanup;
+        }
+        
+        result = vkBindImageMemory(ctx->device, intermediate_image, intermediate_memory, 0);
+        if (result != VK_SUCCESS) {
+            printf("\tFailed to bind intermediate memory: %d\n", result);
+            goto cleanup;
+        }
+    }
+    
+    // Create final destination image (always 8-bit for output)
     VkImageCreateInfo dst_image_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = VK_IMAGE_TYPE_2D,
-        .format = vk_format,
+        .format = final_format,
         .extent = {fb2->width, fb2->height, 1},
         .mipLevels = 1,
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_LINEAR,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | (needs_tone_mapping ? VK_IMAGE_USAGE_STORAGE_BIT : 0),
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
     
-    VkImage dst_image;
     result = vkCreateImage(ctx->device, &dst_image_info, NULL, &dst_image);
     if (result != VK_SUCCESS) {
         printf("\tFailed to create destination image: %d\n", result);
-        vkFreeMemory(ctx->device, src_memory, NULL);
-        vkDestroyImage(ctx->device, src_image, NULL);
-        close(dmabuf_fd);
-        drmModeFreeFB2(fb2);
-        return -1;
+        goto cleanup;
     }
     
     // Allocate memory for destination image
@@ -1139,12 +1573,7 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
     
     if (dst_memory_type == UINT32_MAX) {
         printf("\tNo suitable memory type for destination image\n");
-        vkDestroyImage(ctx->device, dst_image, NULL);
-        vkFreeMemory(ctx->device, src_memory, NULL);
-        vkDestroyImage(ctx->device, src_image, NULL);
-        close(dmabuf_fd);
-        drmModeFreeFB2(fb2);
-        return -1;
+        goto cleanup;
     }
     
     VkMemoryAllocateInfo dst_alloc_info = {
@@ -1153,33 +1582,21 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
         .memoryTypeIndex = dst_memory_type,
     };
     
-    VkDeviceMemory dst_memory;
     result = vkAllocateMemory(ctx->device, &dst_alloc_info, NULL, &dst_memory);
     if (result != VK_SUCCESS) {
         printf("\tFailed to allocate destination memory: %d\n", result);
-        vkDestroyImage(ctx->device, dst_image, NULL);
-        vkFreeMemory(ctx->device, src_memory, NULL);
-        vkDestroyImage(ctx->device, src_image, NULL);
-        close(dmabuf_fd);
-        drmModeFreeFB2(fb2);
-        return -1;
+        goto cleanup;
     }
     
     result = vkBindImageMemory(ctx->device, dst_image, dst_memory, 0);
     if (result != VK_SUCCESS) {
         printf("\tFailed to bind destination memory: %d\n", result);
-        vkFreeMemory(ctx->device, dst_memory, NULL);
-        vkDestroyImage(ctx->device, dst_image, NULL);
-        vkFreeMemory(ctx->device, src_memory, NULL);
-        vkDestroyImage(ctx->device, src_image, NULL);
-        close(dmabuf_fd);
-        drmModeFreeFB2(fb2);
-        return -1;
+        goto cleanup;
     }
     
-    printf("\tCreated linear destination image\n");
+    printf("\tCreated destination image\n");
     
-    // Record and execute copy command
+    // Execute the processing pipeline
     VkCommandBufferAllocateInfo cmd_alloc_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = ctx->command_pool,
@@ -1201,68 +1618,53 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
     
     vkBeginCommandBuffer(cmd_buffer, &begin_info);
     
-    // Transition images to optimal layouts
-    VkImageMemoryBarrier barriers[2] = {
-        {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = src_image,
-            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-            .srcAccessMask = 0,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        },
-        {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = dst_image,
-            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-            .srcAccessMask = 0,
-            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        },
-    };
-    
-    vkCmdPipelineBarrier(cmd_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, barriers);
-    
-    // Copy image (this will automatically handle deswizzling!)
-    VkImageCopy copy_region = {
-        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-        .srcOffset = {0, 0, 0},
-        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-        .dstOffset = {0, 0, 0},
-        .extent = {fb2->width, fb2->height, 1},
-    };
-    
-    vkCmdCopyImage(cmd_buffer, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
-    
-    printf("\tGPU deswizzling in progress...\n");
-    
-    // Transition destination for CPU read
-    VkImageMemoryBarrier final_barrier = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = dst_image,
-        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-    };
-    
-    vkCmdPipelineBarrier(cmd_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 0, NULL, 1, &final_barrier);
+    if (needs_tone_mapping) {
+        // First: Copy tiled -> linear HDR
+        VkImageMemoryBarrier initial_barriers[2] = {
+            {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = src_image,
+                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+                .srcAccessMask = 0,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = intermediate_image,
+                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+                .srcAccessMask = 0,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            },
+        };
+        
+        vkCmdPipelineBarrier(cmd_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, initial_barriers);
+        
+        VkImageCopy copy_region = {
+            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .srcOffset = {0, 0, 0},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .dstOffset = {0, 0, 0},
+            .extent = {fb2->width, fb2->height, 1},
+        };
+        
+        vkCmdCopyImage(cmd_buffer, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       intermediate_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+        
+        printf("\tGPU deswizzling in progress...\n");
+    }
     
     vkEndCommandBuffer(cmd_buffer);
     
-    // Submit and wait
+    // Submit initial copy
     VkSubmitInfo submit_info = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
@@ -1279,9 +1681,29 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
         goto cleanup;
     }
     
-    printf("\tGPU deswizzling completed successfully!\n");
+    if (needs_tone_mapping) {
+        printf("\tApplying HDR tone mapping...\n");
+        // Apply tone mapping: intermediate_image -> dst_image
+        // You can adjust these parameters as needed
+        float exposure = 1.0f;  // Adjust exposure
+        float gamma = 2.2f;     // Standard gamma
+        uint32_t tonemap_mode = 1; // 0=Reinhard, 1=ACES, 2=Hable
+        
+        result = apply_tone_mapping(ctx, &compute_pipeline, 
+                                   intermediate_image, dst_image,
+                                   fb2->width, fb2->height,
+                                   exposure, gamma, tonemap_mode);
+        if (result != 0) {
+            printf("\tTone mapping failed\n");
+            goto cleanup;
+        }
+        
+        printf("\tHDR tone mapping completed successfully!\n");
+    } else {
+        printf("\tGPU deswizzling completed successfully!\n");
+    }
     
-    // Map and read the linear result
+    // Map and read the final result
     void *mapped_data;
     result = vkMapMemory(ctx->device, dst_memory, 0, VK_WHOLE_SIZE, 0, &mapped_data);
     if (result == VK_SUCCESS) {
@@ -1296,11 +1718,14 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
         // Convert and save
         uint8_t *rgb_data = malloc(fb2->width * fb2->height * 3);
         if (rgb_data) {
+            // For tone-mapped output, we have RGBA8, for non-HDR we convert from original format
+            uint32_t convert_format = needs_tone_mapping ? DRM_FORMAT_ABGR8888 : fb2->pixel_format;
             convert_to_rgb24(mapped_data, rgb_data, fb2->width, fb2->height,
-                           fb2->pixel_format, layout.rowPitch);
+                           convert_format, layout.rowPitch);
             
             if (write_ppm(output_path, fb2->width, fb2->height, rgb_data) == 0) {
-                printf("\tDeswizzled screenshot saved to %s\n", output_path);
+                printf("\t%s screenshot saved to %s\n", 
+                       needs_tone_mapping ? "Tone-mapped HDR" : "Deswizzled", output_path);
             }
             free(rgb_data);
         }
@@ -1309,10 +1734,18 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
     }
     
 cleanup:
-    vkFreeMemory(ctx->device, dst_memory, NULL);
-    vkDestroyImage(ctx->device, dst_image, NULL);
+    if (intermediate_memory != VK_NULL_HANDLE)
+        vkFreeMemory(ctx->device, intermediate_memory, NULL);
+    if (intermediate_image != VK_NULL_HANDLE)
+        vkDestroyImage(ctx->device, intermediate_image, NULL);
+    if (dst_memory != VK_NULL_HANDLE)
+        vkFreeMemory(ctx->device, dst_memory, NULL);
+    if (dst_image != VK_NULL_HANDLE)
+        vkDestroyImage(ctx->device, dst_image, NULL);
     vkFreeMemory(ctx->device, src_memory, NULL);
     vkDestroyImage(ctx->device, src_image, NULL);
+    if (needs_tone_mapping)
+        cleanup_compute_pipeline(ctx, &compute_pipeline);
     close(dmabuf_fd);
     drmModeFreeFB2(fb2);
     
