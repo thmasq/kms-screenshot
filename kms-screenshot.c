@@ -1335,7 +1335,7 @@ static int find_primary_framebuffer(int drm_fd) {
 }
 
 static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t fb_id, 
-                                                    const char *output_path) {
+                                      const char *output_path, float exposure, uint32_t tonemap_mode) {
     VkResult result;
     drmModeFB2 *fb2 = drmModeGetFB2(drm_fd, fb_id);
     if (!fb2) {
@@ -1686,8 +1686,6 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
     
     if (needs_tone_mapping) {
         printf("\tApplying HDR tone mapping...\n");
-        float exposure = 1.0f;  // Adjust exposure
-        uint32_t tonemap_mode = 1; // 0=Reinhard, 1=ACES, 2=Hable
         
         result = apply_tone_mapping(ctx, &compute_pipeline, 
                                         intermediate_image, dst_image,
@@ -1754,7 +1752,8 @@ cleanup:
 }
 
 // Update the main integration function
-static int capture_framebuffer_with_vulkan_fallback(int drm_fd, uint32_t fb_id, const char *output_path) {
+static int capture_framebuffer_with_vulkan_fallback(int drm_fd, uint32_t fb_id, 
+                                                   const char *output_path, float exposure, uint32_t tonemap_mode) {
     drmModeFB2 *fb2 = drmModeGetFB2(drm_fd, fb_id);
     if (!fb2) {
         printf("Failed to get framebuffer info\n");
@@ -1767,7 +1766,7 @@ static int capture_framebuffer_with_vulkan_fallback(int drm_fd, uint32_t fb_id, 
         
         VulkanContext vk_ctx = {0};
         if (init_vulkan_context(&vk_ctx) == 0) {
-            int result = vulkan_deswizzle_framebuffer(&vk_ctx, drm_fd, fb_id, output_path);
+            int result = vulkan_deswizzle_framebuffer(&vk_ctx, drm_fd, fb_id, output_path, exposure, tonemap_mode);
             cleanup_vulkan_context(&vk_ctx);
             
             if (result == 0) {
@@ -1895,7 +1894,7 @@ if (fb_id == 0) {
     
     if (version && strcmp(version->name, "amdgpu") == 0) {
         printf("\tAMDGPU detected, trying Vulkan deswizzling first...\n");
-        result = capture_framebuffer_with_vulkan_fallback(drm_fd, fb_id, output_path);
+        result = capture_framebuffer_with_vulkan_fallback(drm_fd, fb_id, output_path, exposure, tonemap_mode);
     } else {
         printf("\tNon-AMDGPU device, using standard capture method...\n");
         result = capture_framebuffer(drm_fd, fb_id, output_path);
