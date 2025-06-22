@@ -7,7 +7,6 @@ layout(binding = 1, rgba8) writeonly uniform image2D outputImage;
 
 layout(push_constant) uniform PushConstants {
     float exposure;
-    float gamma;
     uint tonemapMode; // 0=Reinhard, 1=ACES_Simple, 2=ACES_Full, 3=Hable
 } params;
 
@@ -284,9 +283,7 @@ void main() {
     // Read HDR pixel
     vec4 hdrColor = imageLoad(inputImage, pixelCoord);
     
-    // Handle ABGR16161616 format - try both orderings to see which looks correct
     vec3 color = hdrColor.rgb;
-    // vec3 color = hdrColor.bgr;  // Alternative if colors are wrong
     
     // Clamp negative values
     color = max(color, vec3(0.0));
