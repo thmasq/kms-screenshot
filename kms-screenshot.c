@@ -29,8 +29,7 @@ extern unsigned int hdr_tonemap_comp_spv_len;
 
 typedef struct {
     float exposure;
-    float gamma;
-    uint32_t tonemapMode; // 0=Reinhard, 1=ACES, 2=Hable
+    uint32_t tonemapMode; // 0=Reinhard, 1=ACES_Fast, 2=ACES_Hill, 3=ACES_Day, 4=ACES_Full, 5=Hable, 6=Reinhard_Ext, 7=Uchimura
 } ToneMappingPushConstants;
 
 typedef struct {
@@ -203,9 +202,9 @@ static void cleanup_compute_pipeline(VulkanContext *ctx, ComputePipeline *pipeli
 }
 
 static int apply_tone_mapping(VulkanContext *ctx, ComputePipeline *pipeline,
-                             VkImage input_image, VkImage output_image,
-                             uint32_t width, uint32_t height,
-                             float exposure, float gamma, uint32_t tonemap_mode) {
+                                      VkImage input_image, VkImage output_image,
+                                      uint32_t width, uint32_t height,
+                                      float exposure, uint32_t tonemap_mode) {
     VkResult result;
     
     // Allocate descriptor set
@@ -361,7 +360,6 @@ static int apply_tone_mapping(VulkanContext *ctx, ComputePipeline *pipeline,
     // Set push constants
     ToneMappingPushConstants push_constants = {
         .exposure = exposure,
-        .gamma = gamma,
         .tonemapMode = tonemap_mode,
     };
     
@@ -402,9 +400,14 @@ static int apply_tone_mapping(VulkanContext *ctx, ComputePipeline *pipeline,
     if (result == VK_SUCCESS) {
         result = vkQueueWaitIdle(ctx->queue);
     }
+
+    const char* tonemap_names[] = {
+            "Reinhard", "ACES Fast", "ACES Hill", "ACES Day", "ACES Full RRT", 
+            "Hable", "Reinhard Extended", "Uchimura"
+        };
     
-    printf("\tTone mapping applied: exposure=%.2f, gamma=%.2f, mode=%u\n", 
-           exposure, gamma, tonemap_mode);
+    printf("\tTone mapping applied: %s, exposure=%.2f\n", 
+       tonemap_names[tonemap_mode], exposure);
     
     // Cleanup
     vkDestroyImageView(ctx->device, output_view, NULL);
@@ -1683,16 +1686,14 @@ static int vulkan_deswizzle_framebuffer(VulkanContext *ctx, int drm_fd, uint32_t
     
     if (needs_tone_mapping) {
         printf("\tApplying HDR tone mapping...\n");
-        // Apply tone mapping: intermediate_image -> dst_image
-        // You can adjust these parameters as needed
         float exposure = 1.0f;  // Adjust exposure
-        float gamma = 2.2f;     // Standard gamma
         uint32_t tonemap_mode = 1; // 0=Reinhard, 1=ACES, 2=Hable
         
         result = apply_tone_mapping(ctx, &compute_pipeline, 
-                                   intermediate_image, dst_image,
-                                   fb2->width, fb2->height,
-                                   exposure, gamma, tonemap_mode);
+                                        intermediate_image, dst_image,
+                                        fb2->width, fb2->height,
+                                        exposure, tonemap_mode);
+
         if (result != 0) {
             printf("\tTone mapping failed\n");
             goto cleanup;
@@ -1786,6 +1787,27 @@ static int capture_framebuffer_with_vulkan_fallback(int drm_fd, uint32_t fb_id, 
     return capture_framebuffer_amdgpu(drm_fd, fb_id, output_path);
 }
 
+static void print_usage(const char *prog_name) {
+    printf("Usage: %s [options]\n", prog_name);
+    printf("Options:\n");
+    printf("  --list              List available framebuffers\n");
+    printf("  --device PATH       DRM device path (default: /dev/dri/card1)\n");
+    printf("  --output FILE       Output file (default: screenshot.ppm)\n");
+    printf("  --fb ID             Specific framebuffer ID to capture\n");
+    printf("  --exposure FLOAT    HDR exposure multiplier (default: 1.0)\n");
+    printf("  --tonemap MODE      Tone mapping curve:\n");
+    printf("                        0 = Reinhard (simple)\n");
+    printf("                        1 = ACES Fast (Narkowicz)\n");
+    printf("                        2 = ACES Hill (recommended)\n");
+    printf("                        3 = ACES Day (balanced)\n");
+    printf("                        4 = ACES Full RRT (accurate)\n");
+    printf("                        5 = Hable (Uncharted 2)\n");
+    printf("                        6 = Reinhard Extended\n");
+    printf("                        7 = Uchimura\n");
+    printf("                      Default: 2 (ACES Hill)\n");
+    printf("  --help              Show this help\n");
+}
+
 int main(int argc, char *argv[]) {
     if (getuid() != 0) {
         printf("This program requires root privileges to access DRM devices.\n");
@@ -1797,6 +1819,8 @@ int main(int argc, char *argv[]) {
     const char *output_path = "screenshot.ppm";
     int list_only = 0;
     uint32_t fb_id = 0;
+    float exposure = 1.0f;      // Default exposure
+    uint32_t tonemap_mode = 2;  // Default to ACES Hill
     
     // Parse arguments
     for (int i = 1; i < argc; i++) {
@@ -1808,17 +1832,29 @@ int main(int argc, char *argv[]) {
             output_path = argv[++i];
         } else if (strcmp(argv[i], "--fb") == 0 && i + 1 < argc) {
             fb_id = strtoul(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--exposure") == 0 && i + 1 < argc) {
+            exposure = strtof(argv[++i], NULL);
+            if (exposure <= 0.0f) {
+                printf("Error: Exposure must be positive\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--tonemap") == 0 && i + 1 < argc) {
+            tonemap_mode = strtoul(argv[++i], NULL, 0);
+            if (tonemap_mode > 7) {
+                printf("Error: Invalid tone mapping mode (0-7)\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [options]\n", argv[0]);
-            printf("Options:\n");
-            printf("  --list              List available framebuffers\n");
-            printf("  --device PATH       DRM device path (default: /dev/dri/card0)\n");
-            printf("  --output FILE       Output file (default: screenshot.ppm)\n");
-            printf("  --fb ID             Specific framebuffer ID to capture\n");
-            printf("  --help              Show this help\n");
+            print_usage(argv[0]);
             return 0;
+        } else {
+            printf("Unknown argument: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 1;
         }
     }
+
+    printf("Tone mapping settings: mode=%u, exposure=%.2f\n", tonemap_mode, exposure);
     
     // Open DRM device
     int drm_fd = open(device_path, O_RDWR);

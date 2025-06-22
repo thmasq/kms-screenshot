@@ -5,45 +5,273 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(binding = 0, rgba16) readonly uniform image2D inputImage;
 layout(binding = 1, rgba8) writeonly uniform image2D outputImage;
 
-// Tone mapping parameters
 layout(push_constant) uniform PushConstants {
     float exposure;
     float gamma;
-    uint tonemapMode; // 0=Reinhard, 1=ACES, 2=Hable
+    uint tonemapMode; // 0=Reinhard, 1=ACES_Simple, 2=ACES_Full, 3=Hable
 } params;
 
+// =======================================================================================
+// ACES COLOR SPACE MATRICES
+// =======================================================================================
+
+// sRGB to AP1 (ACES working space) matrix
+const mat3 sRGB_to_AP1 = mat3(
+    0.6131, 0.0701, 0.0206,
+    0.3395, 0.9164, 0.1096,
+    0.0474, 0.0135, 0.8698
+);
+
+// AP1 to sRGB matrix  
+const mat3 AP1_to_sRGB = mat3(
+    1.7050, -0.1302, -0.0240,
+    -0.6217, 1.1408, -0.1289,
+    -0.0833, -0.0106, 1.1529
+);
+
+// AP0 to AP1 matrix (for full ACES pipeline)
+const mat3 AP0_to_AP1 = mat3(
+    1.4514393161, -0.0765537734, 0.0083161484,
+    -0.2365107469, 1.1762296998, -0.0060324498,
+    -0.2149285693, -0.0996759264, 0.9977163014
+);
+
+// AP1 to AP0 matrix
+const mat3 AP1_to_AP0 = mat3(
+    0.6954522414, 0.0447945634, -0.0055258826,
+    0.1406786965, 0.8596711185, 0.0040252103,
+    0.1638690622, 0.0955343182, 1.0015006723
+);
+
+// =======================================================================================
+// ACES CURVE COMPONENTS
+// =======================================================================================
+
+// ACES RRT Sweeteners
+float glow_fwd(float ycIn, float glowGainIn, float glowMid) {
+    float glowGainOut;
+    if (ycIn <= 2.0/3.0 * glowMid) {
+        glowGainOut = glowGainIn;
+    } else if (ycIn >= 2.0 * glowMid) {
+        glowGainOut = 0.0;
+    } else {
+        glowGainOut = glowGainIn * (glowMid / ycIn - 0.5);
+    }
+    return glowGainOut;
+}
+
+float sigmoid_shaper(float x) {
+    // Sigmoid function used in ACES
+    float t = max(1.0 - abs(x / 2.0), 0.0);
+    float y = 1.0 + sign(x) * (1.0 - t * t);
+    return y / 2.0;
+}
+
+// RGB to luminance (Rec. 709)
+float rgb_to_luminance(vec3 rgb) {
+    return dot(rgb, vec3(0.2126729, 0.7151522, 0.0721750));
+}
+
+// RGB to saturation
+float rgb_to_saturation(vec3 rgb) {
+    float minComp = min(min(rgb.r, rgb.g), rgb.b);
+    float maxComp = max(max(rgb.r, rgb.g), rgb.b);
+    return (max(maxComp, 1e-10) - max(minComp, 1e-10)) / max(maxComp, 1e-2);
+}
+
+// =======================================================================================
+// ACES TONE SCALE
+// =======================================================================================
+
+float aces_tonescale(float x) {
+    // ACES tone scale parameters
+    const float a = 278.5085;
+    const float b = 10.7772;
+    const float c = 293.6045;
+    const float d = 88.7122;
+    const float e = 80.6889;
+    
+    return (x * (a * x + b)) / (x * (c * x + d) + e);
+}
+
+// =======================================================================================
+// FULL ACES RRT (Reference Rendering Transform)
+// =======================================================================================
+
+vec3 aces_rrt_full(vec3 aces) {
+    // Convert from AP0 to AP1 working space
+    aces = AP0_to_AP1 * aces;
+    
+    // Clamp negative values
+    aces = max(aces, vec3(0.0));
+    
+    // --- Glow module ---
+    float saturation = rgb_to_saturation(aces);
+    float ycIn = rgb_to_luminance(aces);
+    float s = sigmoid_shaper((saturation - 0.4) / 0.2);
+    float addedGlow = 1.0 + glow_fwd(ycIn, 0.05 * s, 0.08);
+    aces *= addedGlow;
+    
+    // --- Red modifier ---
+    float hue = atan(aces.g, aces.r);
+    float centeredHue = hue + 0.2617993878; // +15 degrees
+    float hueWeight = smoothstep(0.0, 1.0, 1.0 - abs(2.0 * centeredHue / 1.0471975512));
+    hueWeight *= hueWeight;
+    
+    vec3 acesRed = aces;
+    acesRed.r += hueWeight * saturation * (0.03 * aces.r) * (1.0 - pow(aces.r / (aces.r + 0.001), 1.2));
+    aces = mix(aces, acesRed, 0.6);
+    
+    // --- Tone scale ---
+    float luminance = rgb_to_luminance(aces);
+    vec3 rgbPost = aces / max(luminance, 1e-10);
+    float luminancePost = aces_tonescale(luminance);
+    vec3 rgbFinal = rgbPost * luminancePost;
+    
+    // --- Global desaturation ---
+    luminance = rgb_to_luminance(rgbFinal);
+    float desatCoeff = max(1.0 - (luminance - 0.18) / (2.0 - 0.18), 0.0);
+    desatCoeff = smoothstep(0.0, 1.0, desatCoeff);
+    vec3 desat = mix(vec3(luminance), rgbFinal, desatCoeff);
+    
+    return desat;
+}
+
+// =======================================================================================
+// SIMPLIFIED ACES IMPLEMENTATIONS
+// =======================================================================================
+
+// Stephen Hill's ACES approximation (very fast, good quality)
+vec3 aces_hill(vec3 color) {
+    color = sRGB_to_AP1 * color;
+    
+    // Apply RRT and ODT tone curve
+    vec3 a = color * (color + 0.0245786) - 0.000090537;
+    vec3 b = color * (0.983729 * color + 0.4329510) + 0.238081;
+    color = a / b;
+    
+    // Apply gamma and convert back to sRGB
+    color = AP1_to_sRGB * color;
+    return color;
+}
+
+// Krzysztof Narkowicz ACES approximation
+vec3 aces_narkowicz(vec3 color) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+}
+
+// Mike Day's ACES approximation (good balance of speed and accuracy)
+vec3 aces_day(vec3 color) {
+    // Pre-exposure compensation
+    color *= 0.6;
+    
+    // Apply ACES tone curve
+    vec3 a = color * 2.51 + 0.03;
+    vec3 b = color * 2.43 + 0.59;
+    return clamp((color * a) / (color * b + 0.14), 0.0, 1.0);
+}
+
+// =======================================================================================
+// ACES ODT (Output Device Transform) to sRGB
+// =======================================================================================
+
+vec3 aces_odt_srgb(vec3 oces) {
+    // Apply the sRGB ODT
+    vec3 rgbPre = AP1_to_sRGB * oces;
+    
+    // Apply gamma
+    vec3 rgbPost = pow(max(rgbPre, vec3(0.0)), vec3(1.0/2.4));
+    
+    return rgbPost;
+}
+
+// =======================================================================================
+// OTHER TONE MAPPING CURVES FOR COMPARISON
+// =======================================================================================
+
+vec3 reinhard_tonemap(vec3 color) {
+    return color / (color + vec3(1.0));
+}
+
+vec3 reinhard_extended(vec3 color, float white_point) {
+    vec3 numerator = color * (1.0 + (color / (white_point * white_point)));
+    return numerator / (1.0 + color);
+}
+
+vec3 hable_tonemap(vec3 x) {
+    const float A = 0.15;
+    const float B = 0.50;
+    const float C = 0.10;
+    const float D = 0.20;
+    const float E = 0.02;
+    const float F = 0.30;
+    return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F;
+}
+
+vec3 uchimura_tonemap(vec3 x) {
+    const float P = 1.0;  // max display brightness
+    const float a = 1.0;  // contrast
+    const float m = 0.22; // linear section start
+    const float l = 0.4;  // linear section length
+    const float c = 1.33; // black
+    const float b = 0.0;  // pedestal
+    
+    float l0 = ((P - m) * l) / a;
+    float L0 = m - m / a;
+    float L1 = m + (1.0 - m) / a;
+    float S0 = m + l0;
+    float S1 = m + a * l0;
+    float C2 = (a * P) / (P - S1);
+    float CP = -C2 / P;
+    
+    vec3 w0 = vec3(1.0 - smoothstep(0.0, m, x));
+    vec3 w2 = vec3(step(m + l0, x));
+    vec3 w1 = vec3(1.0 - w0 - w2);
+    
+    vec3 T = vec3(m * pow(x / m, vec3(c)) + b);
+    vec3 S = vec3(P - (P - S1) * exp(CP * (x - S0)));
+    vec3 L = vec3(m + a * (x - m));
+    
+    return T * w0 + L * w1 + S * w2;
+}
+
+// =======================================================================================
+// MAIN TONE MAPPING FUNCTION
+// =======================================================================================
+
+vec3 apply_tonemap(vec3 color, uint mode) {
+    switch(mode) {
+        case 0: return reinhard_tonemap(color);
+        case 1: return aces_narkowicz(color);          // Fast ACES approximation
+        case 2: return aces_hill(color);               // Higher quality ACES
+        case 3: return aces_day(color);                // Balanced ACES
+        case 4: return aces_rrt_full(color);           // Full ACES RRT
+        case 5: {
+            // Hable (Uncharted 2)
+            float W = 11.2;
+            return hable_tonemap(color * 2.0) / hable_tonemap(vec3(W));
+        }
+        case 6: return reinhard_extended(color, 4.0);  // Extended Reinhard
+        case 7: return uchimura_tonemap(color);        // Uchimura curve
+        default: return aces_hill(color);              // Default to good ACES
+    }
+}
+
 // Convert from linear to sRGB
-vec3 linearToSRGB(vec3 linear) {
+vec3 linear_to_srgb(vec3 linear) {
     vec3 higher = 1.055 * pow(linear, vec3(1.0/2.4)) - 0.055;
     vec3 lower = linear * 12.92;
     return mix(lower, higher, step(vec3(0.0031308), linear));
 }
 
-// Reinhard tone mapping
-vec3 reinhardTonemap(vec3 color) {
-    return color / (color + vec3(1.0));
-}
-
-// ACES filmic tone mapping
-vec3 acesFimicTonemap(vec3 x) {
-    float a = 2.51;
-    float b = 0.03;
-    float c = 2.43;
-    float d = 0.59;
-    float e = 0.14;
-    return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);
-}
-
-// Uncharted 2 tone mapping
-vec3 hableTonemap(vec3 x) {
-    float A = 0.15;
-    float B = 0.50;
-    float C = 0.10;
-    float D = 0.20;
-    float E = 0.02;
-    float F = 0.30;
-    return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F;
-}
+// =======================================================================================
+// MAIN SHADER
+// =======================================================================================
 
 void main() {
     ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
@@ -53,29 +281,37 @@ void main() {
         return;
     }
     
-    // Read HDR pixel (16-bit per channel, normalized to [0,1])
+    // Read HDR pixel
     vec4 hdrColor = imageLoad(inputImage, pixelCoord);
     
-    // For ABGR format, swap R and B
-    vec3 color = hdrColor.bgr;
+    // Handle ABGR16161616 format - try both orderings to see which looks correct
+    vec3 color = hdrColor.rgb;
+    // vec3 color = hdrColor.bgr;  // Alternative if colors are wrong
+    
+    // Clamp negative values
+    color = max(color, vec3(0.0));
     
     // Apply exposure
     color *= params.exposure;
     
     // Apply tone mapping
-    if (params.tonemapMode == 0) {
-        color = reinhardTonemap(color);
-    } else if (params.tonemapMode == 1) {
-        color = acesFimicTonemap(color);
+    color = apply_tonemap(color, params.tonemapMode);
+    
+    // Ensure we're in valid range
+    color = clamp(color, 0.0, 1.0);
+    
+    // Convert to sRGB for display (only if not already converted by tone mapper)
+    if (params.tonemapMode == 4) {
+        // Full ACES RRT already handles color space conversion
+        color = linear_to_srgb(color);
+    } else if (params.tonemapMode == 2) {
+        // Hill's ACES already converts to sRGB
+        // No additional conversion needed
     } else {
-        float W = 11.2;
-        color = hableTonemap(color * 2.0) / hableTonemap(vec3(W));
+        // Other tone mappers work in linear space, convert to sRGB
+        color = linear_to_srgb(color);
     }
     
-    // Apply gamma correction and convert to sRGB
-    color = pow(color, vec3(1.0 / params.gamma));
-    color = linearToSRGB(color);
-    
-    // Write SDR output (8-bit per channel)
+    // Write final result
     imageStore(outputImage, pixelCoord, vec4(color, hdrColor.a));
 }
