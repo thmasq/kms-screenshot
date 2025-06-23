@@ -34,39 +34,43 @@ vec3 pq_inverse(vec3 pq) {
     return linear * PQ_MAX_NITS; // Convert to cd/m²
 }
 
-// Forward PQ (ST.2084) transfer function  
-// Converts linear light (cd/m²) to PQ-encoded values
-vec3 pq_forward(vec3 linear) {
-    vec3 y = linear / PQ_MAX_NITS;
-    vec3 y_p = pow(max(y, vec3(0.0)), vec3(PQ_m1));
-    vec3 num = PQ_c1 + PQ_c2 * y_p;
-    vec3 den = 1.0 + PQ_c3 * y_p;
-    return pow(num / max(den, vec3(1e-7)), vec3(PQ_m2));
-}
-
 // =======================================================================================
-// COLOR SPACE CONVERSION MATRICES
+// COLOR SPACE CONVERSION MATRICES (D65 white point, normalized)
 // =======================================================================================
 
-// Rec.2020 to Rec.709 matrix (D65 white point)
+// Rec.2020 to XYZ (D65)
+const mat3 REC2020_to_XYZ = mat3(
+    0.6369580, 0.1446169, 0.1688809,
+    0.2627045, 0.6779980, 0.0593017,
+    0.0000000, 0.0280727, 1.0609851
+);
+
+// XYZ to Rec.709 (D65)
+const mat3 XYZ_to_REC709 = mat3(
+    3.2404542, -1.5371385, -0.4985314,
+    -0.9692660, 1.8760108, 0.0415560,
+    0.0556434, -0.2040259, 1.0572252
+);
+
+// Rec.2020 to Rec.709 (direct, more accurate)
 const mat3 REC2020_to_REC709 = mat3(
     1.7166511, -0.3556708, -0.2533663,
     -0.6666844, 1.6164812, 0.0157685,
     0.0176399, -0.0427706, 0.9421031
 );
 
-// sRGB to AP1 (ACES working space) matrix
-const mat3 sRGB_to_AP1 = mat3(
-    0.6131, 0.0701, 0.0206,
-    0.3395, 0.9164, 0.1096,
-    0.0474, 0.0135, 0.8698
+// sRGB/Rec.709 to AP1 (ACES working space) - CORRECTED
+const mat3 REC709_to_AP1 = mat3(
+    0.6131324, 0.0700069, 0.0206594,
+    0.3395380, 0.9163357, 0.1095905,
+    0.0473295, 0.0136574, 0.8697501
 );
 
-// AP1 to sRGB matrix  
-const mat3 AP1_to_sRGB = mat3(
-    1.7050, -0.1302, -0.0240,
-    -0.6217, 1.1408, -0.1289,
-    -0.0833, -0.0106, 1.1529
+// AP1 to sRGB/Rec.709 matrix - CORRECTED  
+const mat3 AP1_to_REC709 = mat3(
+    1.7050515, -0.1302597, -0.0240376,
+    -0.6217905, 1.1408027, -0.1289879,
+    -0.0832610, -0.0105430, 1.1530255
 );
 
 // AP0 to AP1 matrix (for full ACES pipeline)
@@ -82,6 +86,27 @@ const mat3 AP1_to_AP0 = mat3(
     0.1406786965, 0.8596711185, 0.0040252103,
     0.1638690622, 0.0955343182, 1.0015006723
 );
+
+// =======================================================================================
+// UTILITY FUNCTIONS
+// =======================================================================================
+
+// RGB to luminance (Rec. 709 weights)
+float rgb_to_luminance(vec3 rgb) {
+    return dot(rgb, vec3(0.2126729, 0.7151522, 0.0721750));
+}
+
+// RGB to saturation
+float rgb_to_saturation(vec3 rgb) {
+    float minComp = min(min(rgb.r, rgb.g), rgb.b);
+    float maxComp = max(max(rgb.r, rgb.g), rgb.b);
+    return (max(maxComp, 1e-10) - max(minComp, 1e-10)) / max(maxComp, 1e-2);
+}
+
+// Safe power function
+vec3 safe_pow(vec3 color, float power) {
+    return pow(max(color, vec3(0.0)), vec3(power));
+}
 
 // =======================================================================================
 // ACES CURVE COMPONENTS
@@ -105,24 +130,8 @@ float sigmoid_shaper(float x) {
     return y / 2.0;
 }
 
-// RGB to luminance (Rec. 709)
-float rgb_to_luminance(vec3 rgb) {
-    return dot(rgb, vec3(0.2126729, 0.7151522, 0.0721750));
-}
-
-// RGB to saturation
-float rgb_to_saturation(vec3 rgb) {
-    float minComp = min(min(rgb.r, rgb.g), rgb.b);
-    float maxComp = max(max(rgb.r, rgb.g), rgb.b);
-    return (max(maxComp, 1e-10) - max(minComp, 1e-10)) / max(maxComp, 1e-2);
-}
-
-// =======================================================================================
-// ACES TONE SCALE
-// =======================================================================================
-
+// ACES tone scale (RRT curve)
 float aces_tonescale(float x) {
-    // ACES tone scale parameters
     const float a = 278.5085;
     const float b = 10.7772;
     const float c = 293.6045;
@@ -133,101 +142,22 @@ float aces_tonescale(float x) {
 }
 
 // =======================================================================================
-// FULL ACES RRT (Reference Rendering Transform)
+// TONE MAPPING OPERATORS (ALL STANDARDIZED TO EXPECT 0+ LINEAR INPUT)
 // =======================================================================================
 
-vec3 aces_rrt_full(vec3 aces) {
-    // Convert from AP0 to AP1 working space
-    aces = AP0_to_AP1 * aces;
-    
-    // Clamp negative values
-    aces = max(aces, vec3(0.0));
-    
-    // --- Glow module ---
-    float saturation = rgb_to_saturation(aces);
-    float ycIn = rgb_to_luminance(aces);
-    float s = sigmoid_shaper((saturation - 0.4) / 0.2);
-    float addedGlow = 1.0 + glow_fwd(ycIn, 0.05 * s, 0.08);
-    aces *= addedGlow;
-    
-    // --- Red modifier ---
-    float hue = atan(aces.g, aces.r);
-    float centeredHue = hue + 0.2617993878; // +15 degrees
-    float hueWeight = smoothstep(0.0, 1.0, 1.0 - abs(2.0 * centeredHue / 1.0471975512));
-    hueWeight *= hueWeight;
-    
-    vec3 acesRed = aces;
-    acesRed.r += hueWeight * saturation * (0.03 * aces.r) * (1.0 - pow(aces.r / (aces.r + 0.001), 1.2));
-    aces = mix(aces, acesRed, 0.6);
-    
-    // --- Tone scale ---
-    float luminance = rgb_to_luminance(aces);
-    vec3 rgbPost = aces / max(luminance, 1e-10);
-    float luminancePost = aces_tonescale(luminance);
-    vec3 rgbFinal = rgbPost * luminancePost;
-    
-    // --- Global desaturation ---
-    luminance = rgb_to_luminance(rgbFinal);
-    float desatCoeff = max(1.0 - (luminance - 0.18) / (2.0 - 0.18), 0.0);
-    desatCoeff = smoothstep(0.0, 1.0, desatCoeff);
-    vec3 desat = mix(vec3(luminance), rgbFinal, desatCoeff);
-    
-    return desat;
-}
-
-// =======================================================================================
-// SIMPLIFIED ACES IMPLEMENTATIONS
-// =======================================================================================
-
-// Stephen Hill's ACES approximation (very fast, good quality)
-vec3 aces_hill(vec3 color) {
-    color = sRGB_to_AP1 * color;
-    
-    // Apply RRT and ODT tone curve
-    vec3 a = color * (color + 0.0245786) - 0.000090537;
-    vec3 b = color * (0.983729 * color + 0.4329510) + 0.238081;
-    color = a / b;
-    
-    // Apply gamma and convert back to sRGB
-    color = AP1_to_sRGB * color;
-    return color;
-}
-
-// Krzysztof Narkowicz ACES approximation
-vec3 aces_narkowicz(vec3 color) {
-    const float a = 2.51;
-    const float b = 0.03;
-    const float c = 2.43;
-    const float d = 0.59;
-    const float e = 0.14;
-    return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
-}
-
-// Mike Day's ACES approximation (good balance of speed and accuracy)
-vec3 aces_day(vec3 color) {
-    // Pre-exposure compensation
-    color *= 0.6;
-    
-    // Apply ACES tone curve
-    vec3 a = color * 2.51 + 0.03;
-    vec3 b = color * 2.43 + 0.59;
-    return clamp((color * a) / (color * b + 0.14), 0.0, 1.0);
-}
-
-// =======================================================================================
-// OTHER TONE MAPPING CURVES FOR COMPARISON
-// =======================================================================================
-
+// Simple Reinhard
 vec3 reinhard_tonemap(vec3 color) {
     return color / (color + vec3(1.0));
 }
 
+// Extended Reinhard with white point
 vec3 reinhard_extended(vec3 color, float white_point) {
     vec3 numerator = color * (1.0 + (color / (white_point * white_point)));
     return numerator / (1.0 + color);
 }
 
-vec3 hable_tonemap(vec3 x) {
+// Hable (Uncharted 2) curve
+vec3 hable_curve(vec3 x) {
     const float A = 0.15;
     const float B = 0.50;
     const float C = 0.10;
@@ -237,6 +167,12 @@ vec3 hable_tonemap(vec3 x) {
     return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F;
 }
 
+vec3 hable_tonemap(vec3 color) {
+    const float W = 11.2; // White point
+    return hable_curve(color * 2.0) / hable_curve(vec3(W));
+}
+
+// Uchimura tone mapping
 vec3 uchimura_tonemap(vec3 x) {
     const float P = 1.0;  // max display brightness
     const float a = 1.0;  // contrast
@@ -265,36 +201,129 @@ vec3 uchimura_tonemap(vec3 x) {
 }
 
 // =======================================================================================
-// MAIN TONE MAPPING FUNCTION
+// ACES IMPLEMENTATIONS (CORRECTED TO USE AP1 COLOR SPACE)
+// =======================================================================================
+
+// Krzysztof Narkowicz ACES approximation (expects AP1 input)
+vec3 aces_narkowicz(vec3 color) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+}
+
+// Stephen Hill's ACES approximation (with proper color space handling)
+vec3 aces_hill(vec3 color) {
+    // Convert to AP1 for processing
+    color = REC709_to_AP1 * color;
+    
+    // Apply RRT and ODT tone curve
+    vec3 a = color * (color + 0.0245786) - 0.000090537;
+    vec3 b = color * (0.983729 * color + 0.4329510) + 0.238081;
+    color = a / b;
+    
+    // Convert back to Rec.709
+    return AP1_to_REC709 * color;
+}
+
+// Mike Day's ACES approximation
+vec3 aces_day(vec3 color) {
+    // Convert to AP1
+    color = REC709_to_AP1 * color;
+    
+    // Pre-exposure compensation for ACES
+    color *= 0.6;
+    
+    // Apply ACES tone curve
+    vec3 a = color * 2.51 + 0.03;
+    vec3 b = color * 2.43 + 0.59;
+    color = clamp((color * a) / (color * b + 0.14), 0.0, 1.0);
+    
+    // Convert back to Rec.709
+    return AP1_to_REC709 * color;
+}
+
+// Full ACES RRT (Reference Rendering Transform)
+vec3 aces_rrt_full(vec3 color) {
+    // Convert to AP1 working space
+    color = REC709_to_AP1 * color;
+    
+    // Convert to AP0 for RRT processing
+    color = AP1_to_AP0 * color;
+    
+    // Clamp negative values
+    color = max(color, vec3(0.0));
+    
+    // Convert back to AP1 for tone scale
+    color = AP0_to_AP1 * color;
+    
+    // --- Glow module ---
+    float saturation = rgb_to_saturation(color);
+    float ycIn = rgb_to_luminance(color);
+    float s = sigmoid_shaper((saturation - 0.4) / 0.2);
+    float addedGlow = 1.0 + glow_fwd(ycIn, 0.05 * s, 0.08);
+    color *= addedGlow;
+    
+    // --- Red modifier ---
+    float hue = atan(color.g, color.r);
+    float centeredHue = hue + 0.2617993878; // +15 degrees
+    float hueWeight = smoothstep(0.0, 1.0, 1.0 - abs(2.0 * centeredHue / 1.0471975512));
+    hueWeight *= hueWeight;
+    
+    vec3 acesRed = color;
+    acesRed.r += hueWeight * saturation * (0.03 * color.r) * (1.0 - pow(color.r / (color.r + 0.001), 1.2));
+    color = mix(color, acesRed, 0.6);
+    
+    // --- Tone scale ---
+    float luminance = rgb_to_luminance(color);
+    vec3 rgbPost = color / max(luminance, 1e-10);
+    float luminancePost = aces_tonescale(luminance);
+    vec3 rgbFinal = rgbPost * luminancePost;
+    
+    // --- Global desaturation ---
+    luminance = rgb_to_luminance(rgbFinal);
+    float desatCoeff = max(1.0 - (luminance - 0.18) / (2.0 - 0.18), 0.0);
+    desatCoeff = smoothstep(0.0, 1.0, desatCoeff);
+    vec3 desat = mix(vec3(luminance), rgbFinal, desatCoeff);
+    
+    // Convert back to Rec.709
+    return AP1_to_REC709 * desat;
+}
+
+// =======================================================================================
+// MAIN TONE MAPPING DISPATCHER
 // =======================================================================================
 
 vec3 apply_tonemap(vec3 color, uint mode) {
+    // All tone mappers now expect linear Rec.709 input in scene-referred range
     switch(mode) {
         case 0: return reinhard_tonemap(color);
-        case 1: return aces_narkowicz(color);          // Fast ACES approximation
-        case 2: return aces_hill(color);               // Higher quality ACES
-        case 3: return aces_day(color);                // Balanced ACES
-        case 4: return aces_rrt_full(color);           // Full ACES RRT
-        case 5: {
-            // Hable (Uncharted 2)
-            float W = 11.2;
-            return hable_tonemap(color * 2.0) / hable_tonemap(vec3(W));
+        case 1: {
+            // For Narkowicz, convert to AP1, apply, convert back
+            vec3 ap1_color = REC709_to_AP1 * color;
+            return AP1_to_REC709 * aces_narkowicz(ap1_color);
         }
-        case 6: return reinhard_extended(color, 4.0);  // Extended Reinhard
-        case 7: return uchimura_tonemap(color);        // Uchimura curve
-        default: return aces_hill(color);              // Default to good ACES
+        case 2: return aces_hill(color);
+        case 3: return aces_day(color);
+        case 4: return aces_rrt_full(color);
+        case 5: return hable_tonemap(color);
+        case 6: return reinhard_extended(color, 4.0);
+        case 7: return uchimura_tonemap(color);
+        default: return aces_hill(color);
     }
 }
 
-// Convert from linear to sRGB
+// Convert from linear to sRGB gamma
 vec3 linear_to_srgb(vec3 linear) {
-    vec3 higher = 1.055 * pow(linear, vec3(1.0/2.4)) - 0.055;
+    vec3 higher = 1.055 * safe_pow(linear, 1.0/2.4) - 0.055;
     vec3 lower = linear * 12.92;
     return mix(lower, higher, step(vec3(0.0031308), linear));
 }
 
 // =======================================================================================
-// MAIN SHADER - CORRECTED FOR PQ + REC.2020
+// MAIN SHADER - IMPROVED PIPELINE
 // =======================================================================================
 
 void main() {
@@ -318,14 +347,39 @@ void main() {
     // STEP 3: Convert from Rec.2020 to Rec.709 color primaries
     color = REC2020_to_REC709 * color;
     
-    // STEP 4: Normalize to working range (cd/m² → relative)
-    // Typical SDR white is ~100 cd/m², but we'll use exposure control
-    color = color / 100.0; // Convert cd/m² to relative exposure units
+    // STEP 4: Intelligent normalization based on tone mapping mode
+    // Different tone mappers work best with different input ranges
+    float normalization_factor;
+    switch(params.tonemapMode) {
+        case 0: // Reinhard - works well with 0-10 range
+            normalization_factor = 100.0;
+            break;
+        case 1:
+        case 2:
+        case 3:
+        case 4: // ACES variants - work best with scene-referred values (0-16+)
+            normalization_factor = 80.0; // Slightly less aggressive
+            break;
+        case 5: // Hable - works well with 0-4 range
+            normalization_factor = 200.0;
+            break;
+        case 6: // Reinhard Extended - works well with 0-8 range  
+            normalization_factor = 120.0;
+            break;
+        case 7: // Uchimura - works well with 0-2 range
+            normalization_factor = 400.0;
+            break;
+        default:
+            normalization_factor = 100.0;
+    }
     
-    // STEP 5: Apply exposure adjustment
+    // Convert cd/m² to scene-referred linear values
+    color = color / normalization_factor;
+    
+    // STEP 5: Apply exposure adjustment AFTER normalization
     color = color * params.exposure;
     
-    // STEP 6: Apply tone mapping
+    // STEP 6: Apply tone mapping (all operators now receive standardized input)
     color = apply_tonemap(color, params.tonemapMode);
     
     // STEP 7: Ensure we're in valid range after tone mapping
