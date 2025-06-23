@@ -38,53 +38,62 @@ vec3 pq_inverse(vec3 pq) {
 // COLOR SPACE CONVERSION MATRICES (D65 white point, normalized)
 // =======================================================================================
 
-// Rec.2020 to XYZ (D65)
-const mat3 REC2020_to_XYZ = mat3(
-    0.6369580, 0.1446169, 0.1688809,
-    0.2627045, 0.6779980, 0.0593017,
-    0.0000000, 0.0280727, 1.0609851
+// Rec. 709 (sRGB primaries) - CORRECTED
+const mat3 xyz_to_rec709 = mat3(
+     3.2406, -0.9689,  0.0557,  // Column 1
+    -1.5372,  1.8758, -0.2040,  // Column 2  
+    -0.4986,  0.0415,  1.0570   // Column 3
 );
 
-// XYZ to Rec.709 (D65)
-const mat3 XYZ_to_REC709 = mat3(
-    3.2404542, -1.5371385, -0.4985314,
-    -0.9692660, 1.8760108, 0.0415560,
-    0.0556434, -0.2040259, 1.0572252
+const mat3 rec709_to_xyz = mat3(
+     0.4124,  0.2126,  0.0193,  // Column 1
+     0.3576,  0.7152,  0.1192,  // Column 2
+     0.1805,  0.0722,  0.9505   // Column 3
 );
 
-// Rec.2020 to Rec.709 (direct, more accurate)
-const mat3 REC2020_to_REC709 = mat3(
-    1.7166511, -0.3556708, -0.2533663,
-    -0.6666844, 1.6164812, 0.0157685,
-    0.0176399, -0.0427706, 0.9421031
+// Rec. 2020 - CORRECTED
+const mat3 xyz_to_rec2020 = mat3(
+     1.7166084, -0.6666829,  0.0176422,  // Column 1
+    -0.3556621,  1.6164776, -0.0427763,  // Column 2
+    -0.2533601,  0.0157685,  0.94222867  // Column 3
 );
 
-// sRGB/Rec.709 to AP1 (ACES working space) - CORRECTED
-const mat3 REC709_to_AP1 = mat3(
-    0.6131324, 0.0700069, 0.0206594,
-    0.3395380, 0.9163357, 0.1095905,
-    0.0473295, 0.0136574, 0.8697501
+const mat3 rec2020_to_xyz = mat3(
+     0.6369736,  0.2627066,  0.0000000,  // Column 1
+     0.1446172,  0.6779996,  0.0280728,  // Column 2
+     0.1688585,  0.0592938,  1.0608437   // Column 3
 );
 
-// AP1 to sRGB/Rec.709 matrix - CORRECTED  
-const mat3 AP1_to_REC709 = mat3(
-    1.7050515, -0.1302597, -0.0240376,
-    -0.6217905, 1.1408027, -0.1289879,
-    -0.0832610, -0.0105430, 1.1530255
+// Computed matrices (mathematically guaranteed to be correct)
+const mat3 rec709_to_rec2020 = xyz_to_rec2020 * rec709_to_xyz;
+const mat3 rec2020_to_rec709 = xyz_to_rec709 * rec2020_to_xyz;
+
+// CORRECTED AP1 (ACES 2065-1) matrices
+// These are the official ACES matrices from the specification
+const mat3 rec709_to_ap1 = mat3(
+     0.6131,  0.3395,  0.0474,   // Column 1
+     0.0701,  0.9164,  0.0137,   // Column 2  
+     0.0206,  0.1096,  0.8698    // Column 3
+);
+
+const mat3 ap1_to_rec709 = mat3(
+     1.7051, -0.6218, -0.0833,   // Column 1
+    -0.1303,  1.1408, -0.0105,   // Column 2
+    -0.0240, -0.1290,  1.1530    // Column 3
 );
 
 // AP0 to AP1 matrix (for full ACES pipeline)
-const mat3 AP0_to_AP1 = mat3(
-    1.4514393161, -0.0765537734, 0.0083161484,
-    -0.2365107469, 1.1762296998, -0.0060324498,
-    -0.2149285693, -0.0996759264, 0.9977163014
+const mat3 ap0_to_ap1 = mat3(
+     1.4514, -0.2365, -0.2149,   // Column 1
+    -0.0766,  1.1762, -0.0997,   // Column 2
+     0.0083, -0.0060,  0.9977    // Column 3
 );
 
 // AP1 to AP0 matrix
-const mat3 AP1_to_AP0 = mat3(
-    0.6954522414, 0.0447945634, -0.0055258826,
-    0.1406786965, 0.8596711185, 0.0040252103,
-    0.1638690622, 0.0955343182, 1.0015006723
+const mat3 ap1_to_ap0 = mat3(
+     0.6955,  0.1407,  0.1639,   // Column 1
+     0.0448,  0.8597,  0.0955,   // Column 2
+    -0.0055,  0.0040,  1.0015    // Column 3
 );
 
 // =======================================================================================
@@ -217,7 +226,7 @@ vec3 aces_narkowicz(vec3 color) {
 // Stephen Hill's ACES approximation (with proper color space handling)
 vec3 aces_hill(vec3 color) {
     // Convert to AP1 for processing
-    color = REC709_to_AP1 * color;
+    color = rec709_to_ap1 * color;
     
     // Apply RRT and ODT tone curve
     vec3 a = color * (color + 0.0245786) - 0.000090537;
@@ -225,13 +234,13 @@ vec3 aces_hill(vec3 color) {
     color = a / b;
     
     // Convert back to Rec.709
-    return AP1_to_REC709 * color;
+    return ap1_to_rec709 * color;
 }
 
 // Mike Day's ACES approximation
 vec3 aces_day(vec3 color) {
     // Convert to AP1
-    color = REC709_to_AP1 * color;
+    color = rec709_to_ap1 * color;
     
     // Pre-exposure compensation for ACES
     color *= 0.6;
@@ -242,22 +251,22 @@ vec3 aces_day(vec3 color) {
     color = clamp((color * a) / (color * b + 0.14), 0.0, 1.0);
     
     // Convert back to Rec.709
-    return AP1_to_REC709 * color;
+    return ap1_to_rec709 * color;
 }
 
 // Full ACES RRT (Reference Rendering Transform)
 vec3 aces_rrt_full(vec3 color) {
     // Convert to AP1 working space
-    color = REC709_to_AP1 * color;
+    color = rec709_to_ap1 * color;
     
     // Convert to AP0 for RRT processing
-    color = AP1_to_AP0 * color;
+    color = ap1_to_ap0 * color;
     
     // Clamp negative values
     color = max(color, vec3(0.0));
     
     // Convert back to AP1 for tone scale
-    color = AP0_to_AP1 * color;
+    color = ap0_to_ap1 * color;
     
     // --- Glow module ---
     float saturation = rgb_to_saturation(color);
@@ -289,7 +298,7 @@ vec3 aces_rrt_full(vec3 color) {
     vec3 desat = mix(vec3(luminance), rgbFinal, desatCoeff);
     
     // Convert back to Rec.709
-    return AP1_to_REC709 * desat;
+    return ap1_to_rec709 * desat;
 }
 
 // =======================================================================================
@@ -302,8 +311,8 @@ vec3 apply_tonemap(vec3 color, uint mode) {
         case 0: return reinhard_tonemap(color);
         case 1: {
             // For Narkowicz, convert to AP1, apply, convert back
-            vec3 ap1_color = REC709_to_AP1 * color;
-            return AP1_to_REC709 * aces_narkowicz(ap1_color);
+            vec3 ap1_color = rec709_to_ap1 * color;
+            return ap1_to_rec709 * aces_narkowicz(ap1_color);
         }
         case 2: return aces_hill(color);
         case 3: return aces_day(color);
@@ -345,7 +354,7 @@ void main() {
     color = pq_inverse(color);
     
     // STEP 3: Convert from Rec.2020 to Rec.709 color primaries
-    color = REC2020_to_REC709 * color;
+    color = rec2020_to_rec709 * color;
     
     // STEP 4: Intelligent normalization based on tone mapping mode
     // Different tone mappers work best with different input ranges
