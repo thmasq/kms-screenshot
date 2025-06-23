@@ -718,9 +718,7 @@ static const char *format_to_string(uint32_t format) {
 
 // AMDGPU buffer copy using SDMA
 static int amdgpu_copy_buffer(amdgpu_device_handle dev, amdgpu_context_handle ctx,
-                             amdgpu_bo_handle src_bo, uint64_t src_va,
-                             amdgpu_bo_handle dst_bo, uint64_t dst_va,
-                             uint64_t size) {
+                             uint64_t src_va, uint64_t dst_va, uint64_t size) {
     amdgpu_bo_handle ib_bo;
     void *ib_cpu;
     uint64_t ib_mc;
@@ -890,14 +888,11 @@ static int capture_framebuffer_amdgpu(int drm_fd, uint32_t fb_id, const char *ou
     src_bo = import_result.buf_handle;
     
     // Calculate size based on format
-    size_t bytes_per_pixel = 8; // For ABGR16161616
     if (fb2->pixel_format == DRM_FORMAT_XRGB8888 || 
         fb2->pixel_format == DRM_FORMAT_ARGB8888 ||
         fb2->pixel_format == DRM_FORMAT_XBGR8888 ||
         fb2->pixel_format == DRM_FORMAT_ABGR8888) {
-        bytes_per_pixel = 4;
     } else if (fb2->pixel_format == DRM_FORMAT_RGB565) {
-        bytes_per_pixel = 2;
     }
     
     size_t buffer_size = fb2->pitches[0] * fb2->height;
@@ -986,7 +981,7 @@ static int capture_framebuffer_amdgpu(int drm_fd, uint32_t fb_id, const char *ou
     
     // Perform GPU copy
     printf("Performing GPU copy using SDMA...\n");
-    r = amdgpu_copy_buffer(adev, ctx, src_bo, src_va, dst_bo, dst_va, buffer_size);
+    r = amdgpu_copy_buffer(adev, ctx, src_va, dst_va, buffer_size);
     if (r) {
         printf("GPU copy failed: %d\n", r);
         amdgpu_bo_va_op(dst_bo, 0, buffer_size, dst_va, 0, AMDGPU_VA_OP_UNMAP);
