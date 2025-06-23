@@ -11,8 +11,49 @@ layout(push_constant) uniform PushConstants {
 } params;
 
 // =======================================================================================
-// ACES COLOR SPACE MATRICES
+// PQ (SMPTE ST 2084) TRANSFER FUNCTIONS
 // =======================================================================================
+
+// PQ constants
+const float PQ_m1 = 0.1593017578125; // 2610.0 / 4096.0 / 4.0
+const float PQ_m2 = 78.84375; // 2523.0 / 4096.0 * 128.0
+const float PQ_c1 = 0.8359375; // 3424.0 / 4096.0
+const float PQ_c2 = 18.8515625; // 2413.0 / 4096.0 * 32.0
+const float PQ_c3 = 18.6875; // 2392.0 / 4096.0 * 32.0
+
+// PQ peak luminance (10,000 nits)
+const float PQ_MAX_NITS = 10000.0;
+
+// Inverse PQ (ST.2084) transfer function
+// Converts PQ-encoded values to linear light (cd/m²)
+vec3 pq_inverse(vec3 pq) {
+    vec3 p = pow(max(pq, vec3(0.0)), vec3(1.0 / PQ_m2));
+    vec3 d = max(p - PQ_c1, vec3(0.0));
+    vec3 d2 = PQ_c2 - PQ_c3 * p;
+    vec3 linear = pow(d / max(d2, vec3(1e-7)), vec3(1.0 / PQ_m1));
+    return linear * PQ_MAX_NITS; // Convert to cd/m²
+}
+
+// Forward PQ (ST.2084) transfer function  
+// Converts linear light (cd/m²) to PQ-encoded values
+vec3 pq_forward(vec3 linear) {
+    vec3 y = linear / PQ_MAX_NITS;
+    vec3 y_p = pow(max(y, vec3(0.0)), vec3(PQ_m1));
+    vec3 num = PQ_c1 + PQ_c2 * y_p;
+    vec3 den = 1.0 + PQ_c3 * y_p;
+    return pow(num / max(den, vec3(1e-7)), vec3(PQ_m2));
+}
+
+// =======================================================================================
+// COLOR SPACE CONVERSION MATRICES
+// =======================================================================================
+
+// Rec.2020 to Rec.709 matrix (D65 white point)
+const mat3 REC2020_to_REC709 = mat3(
+    1.7166511, -0.3556708, -0.2533663,
+    -0.6666844, 1.6164812, 0.0157685,
+    0.0176399, -0.0427706, 0.9421031
+);
 
 // sRGB to AP1 (ACES working space) matrix
 const mat3 sRGB_to_AP1 = mat3(
@@ -46,7 +87,6 @@ const mat3 AP1_to_AP0 = mat3(
 // ACES CURVE COMPONENTS
 // =======================================================================================
 
-// ACES RRT Sweeteners
 float glow_fwd(float ycIn, float glowGainIn, float glowMid) {
     float glowGainOut;
     if (ycIn <= 2.0/3.0 * glowMid) {
@@ -60,7 +100,6 @@ float glow_fwd(float ycIn, float glowGainIn, float glowMid) {
 }
 
 float sigmoid_shaper(float x) {
-    // Sigmoid function used in ACES
     float t = max(1.0 - abs(x / 2.0), 0.0);
     float y = 1.0 + sign(x) * (1.0 - t * t);
     return y / 2.0;
@@ -176,20 +215,6 @@ vec3 aces_day(vec3 color) {
 }
 
 // =======================================================================================
-// ACES ODT (Output Device Transform) to sRGB
-// =======================================================================================
-
-vec3 aces_odt_srgb(vec3 oces) {
-    // Apply the sRGB ODT
-    vec3 rgbPre = AP1_to_sRGB * oces;
-    
-    // Apply gamma
-    vec3 rgbPost = pow(max(rgbPre, vec3(0.0)), vec3(1.0/2.4));
-    
-    return rgbPost;
-}
-
-// =======================================================================================
 // OTHER TONE MAPPING CURVES FOR COMPARISON
 // =======================================================================================
 
@@ -269,7 +294,7 @@ vec3 linear_to_srgb(vec3 linear) {
 }
 
 // =======================================================================================
-// MAIN SHADER
+// MAIN SHADER - CORRECTED FOR PQ + REC.2020
 // =======================================================================================
 
 void main() {
@@ -280,34 +305,34 @@ void main() {
         return;
     }
     
-    // Read HDR pixel
+    // Read HDR pixel (16-bit UNORM values from 0.0 to 1.0)
     vec4 hdrColor = imageLoad(inputImage, pixelCoord);
-    
     vec3 color = hdrColor.rgb;
     
-    // Clamp negative values
-    color = max(color, vec3(0.0));
-    
-    // Apply exposure
-    color *= params.exposure;
-    
-    // Apply tone mapping
-    color = apply_tonemap(color, params.tonemapMode);
-    
-    // Ensure we're in valid range
+    // STEP 1: Clamp to valid range
     color = clamp(color, 0.0, 1.0);
     
-    // Convert to sRGB for display (only if not already converted by tone mapper)
-    if (params.tonemapMode == 4) {
-        // Full ACES RRT already handles color space conversion
-        color = linear_to_srgb(color);
-    } else if (params.tonemapMode == 2) {
-        // Hill's ACES already converts to sRGB
-        // No additional conversion needed
-    } else {
-        // Other tone mappers work in linear space, convert to sRGB
-        color = linear_to_srgb(color);
-    }
+    // STEP 2: Inverse PQ transform (PQ-encoded → linear light in cd/m²)
+    color = pq_inverse(color);
+    
+    // STEP 3: Convert from Rec.2020 to Rec.709 color primaries
+    color = REC2020_to_REC709 * color;
+    
+    // STEP 4: Normalize to working range (cd/m² → relative)
+    // Typical SDR white is ~100 cd/m², but we'll use exposure control
+    color = color / 100.0; // Convert cd/m² to relative exposure units
+    
+    // STEP 5: Apply exposure adjustment
+    color = color * params.exposure;
+    
+    // STEP 6: Apply tone mapping
+    color = apply_tonemap(color, params.tonemapMode);
+    
+    // STEP 7: Ensure we're in valid range after tone mapping
+    color = clamp(color, 0.0, 1.0);
+    
+    // STEP 8: Convert to sRGB for display
+    color = linear_to_srgb(color);
     
     // Write final result
     imageStore(outputImage, pixelCoord, vec4(color, hdrColor.a));
